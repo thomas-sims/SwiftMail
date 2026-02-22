@@ -138,7 +138,12 @@ final class FetchMessageInfoHandler: BaseIMAPCommandHandler<[MessageInfo]>, IMAP
                 
                 // Remove timezone comments in parentheses
                 let cleanDateString = dateString.replacingOccurrences(of: "\\s*\\([^)]+\\)\\s*$", with: "", options: .regularExpression)
-                
+
+                // Skip empty date strings — internalDate fallback handles this
+                guard !cleanDateString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    break
+                }
+
                 // Create a date formatter for RFC 5322 dates
                 let formatter = DateFormatter()
                 formatter.locale = Locale(identifier: "en_US_POSIX")
