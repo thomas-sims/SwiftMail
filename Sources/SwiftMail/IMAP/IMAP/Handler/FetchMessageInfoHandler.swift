@@ -149,7 +149,17 @@ final class FetchMessageInfoHandler: BaseIMAPCommandHandler<[MessageInfo]>, IMAP
                     "EEE, dd MMM yyyy HH:mm:ss Z",       // RFC 5322
                     "EEE, d MMM yyyy HH:mm:ss Z",        // RFC 5322 with single-digit day
                     "d MMM yyyy HH:mm:ss Z",             // Without day of week
-                    "EEE, dd MMM yy HH:mm:ss Z"          // Two-digit year
+                    "dd MMM yyyy HH:mm:ss Z",            // Without day of week, two-digit day
+                    "EEE, dd MMM yy HH:mm:ss Z",         // Two-digit year
+                    "EEE, d MMM yy HH:mm:ss Z",          // Two-digit year, single-digit day
+                    "d MMM yy HH:mm:ss Z",               // Two-digit year, no day of week
+                    "dd MMM yy HH:mm:ss Z",              // Two-digit year, no day of week, two-digit day
+                    "d MMM yy HH:mm Z",                  // Two-digit year, no seconds
+                    "dd MMM yy HH:mm Z",                 // Two-digit year, no seconds, two-digit day
+                    "EEE, d MMM yy HH:mm Z",             // Two-digit year, no seconds, with day of week
+                    "EEE, dd MMM yy HH:mm Z",            // Two-digit year, no seconds, with day of week, two-digit day
+                    "d MMM yyyy HH:mm Z",                // Four-digit year, no seconds
+                    "dd MMM yyyy HH:mm Z",               // Four-digit year, no seconds, two-digit day
                 ]
                 
                 for format in formats {
