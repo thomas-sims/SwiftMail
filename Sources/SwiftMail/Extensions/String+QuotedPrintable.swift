@@ -4,22 +4,133 @@ import CoreFoundation
 #endif
 
 extension String {
-    /// Encodes the string using quoted-printable encoding
+    /// Encodes the string using RFC 2045 quoted-printable encoding for message bodies.
+    ///
+    /// Per RFC 2045:
+    /// - Printable ASCII (33-126) pass through, except `=` which becomes `=3D`
+    /// - Spaces and tabs are literal, except trailing whitespace at end of line is encoded
+    /// - Lines are wrapped at 76 characters with soft line breaks (`=\r\n`)
+    /// - Bare CR or LF (not part of CRLF) are encoded
+    /// - All other bytes are hex-encoded (`=XX`)
     public func quotedPrintableEncoded() -> String {
-        var encoded = ""
-        let allowedCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!*+-/=_ ")
+        // Split into lines on any line ending style, preserving structure
+        let lines = self.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
 
-        for char in utf8 {
-            if allowedCharacters.contains(UnicodeScalar(char)) && char != UInt8(ascii: " ") {
-                encoded.append(Character(UnicodeScalar(char)))
-            } else if char == UInt8(ascii: " ") {
+        var result: [String] = []
+
+        for line in lines {
+            // Encode bytes for this line
+            var encodedChars: [String] = []
+            let utf8Bytes = Array(line.utf8)
+
+            for byte in utf8Bytes {
+                if byte == UInt8(ascii: "=") {
+                    encodedChars.append("=3D")
+                } else if byte == UInt8(ascii: "\t") {
+                    encodedChars.append("\t")
+                } else if byte == UInt8(ascii: " ") {
+                    encodedChars.append(" ")
+                } else if byte >= 33 && byte <= 126 {
+                    // Printable ASCII (excluding = which is handled above)
+                    encodedChars.append(String(Character(UnicodeScalar(byte))))
+                } else {
+                    encodedChars.append(String(format: "=%02X", byte))
+                }
+            }
+
+            // Encode trailing whitespace on the line
+            while let last = encodedChars.last, (last == " " || last == "\t") {
+                encodedChars.removeLast()
+                if last == " " {
+                    encodedChars.append("=20")
+                } else {
+                    encodedChars.append("=09")
+                }
+            }
+
+            // Wrap at 76 characters with soft line breaks
+            var wrapped = ""
+            var lineLen = 0
+
+            for token in encodedChars {
+                let tokenLen = token.count
+                // If adding this token would exceed 76 chars (need room for "=" soft break),
+                // insert a soft line break first. 75 because "=" takes 1 char at position 76.
+                if lineLen + tokenLen > 75 {
+                    wrapped += "=\r\n"
+                    lineLen = 0
+                }
+                wrapped += token
+                lineLen += tokenLen
+            }
+
+            result.append(wrapped)
+        }
+
+        return result.joined(separator: "\r\n")
+    }
+
+    /// Encodes the string using RFC 2047 Q-encoding for use in MIME headers.
+    ///
+    /// Per RFC 2047:
+    /// - Spaces are replaced with underscores
+    /// - Printable ASCII passes through (except specials)
+    /// - All other bytes are hex-encoded (`=XX`)
+    public func quotedPrintableEncodedForHeader() -> String {
+        var encoded = ""
+
+        for byte in utf8 {
+            if byte == UInt8(ascii: " ") {
                 encoded.append("_")
+            } else if byte == UInt8(ascii: "=") {
+                encoded.append("=3D")
+            } else if byte == UInt8(ascii: "?") {
+                encoded.append("=3F")
+            } else if byte == UInt8(ascii: "_") {
+                encoded.append("=5F")
+            } else if byte >= 33 && byte <= 126 {
+                encoded.append(Character(UnicodeScalar(byte)))
             } else {
-                encoded.append(String(format: "=%02X", char))
+                encoded.append(String(format: "=%02X", byte))
             }
         }
 
         return encoded
+    }
+
+    /// Encodes the string for use in an RFC 2047 encoded-word in email headers.
+    ///
+    /// If the string is pure ASCII printable, returns it unchanged.
+    /// Otherwise, returns `=?UTF-8?B?<base64>?=` with line folding for long values.
+    public func rfc2047Encoded() -> String {
+        // Check if encoding is needed — pure printable ASCII can go raw
+        let isAsciiSafe = self.utf8.allSatisfy { $0 >= 32 && $0 <= 126 }
+        if isAsciiSafe && self.count <= 76 {
+            return self
+        }
+
+        let utf8Data = Data(self.utf8)
+
+        // RFC 2047 encoded-word max is 75 chars: =?UTF-8?B?...?=
+        // Prefix "=?UTF-8?B?" is 10 chars, suffix "?=" is 2 chars → 63 chars for base64
+        // 63 base64 chars encodes 47 bytes (floor(63/4)*3 = 45, but 47 rounds to 64 chars)
+        // Use 45 bytes per chunk → 60 base64 chars → 72 total (safe under 75)
+        let maxBytesPerChunk = 45
+        var offset = 0
+        var parts: [String] = []
+
+        while offset < utf8Data.count {
+            let end = min(offset + maxBytesPerChunk, utf8Data.count)
+            let chunk = utf8Data[offset..<end]
+            let b64 = chunk.base64EncodedString()
+            parts.append("=?UTF-8?B?\(b64)?=")
+            offset = end
+        }
+
+        // Join with folding whitespace (CRLF + space) per RFC 2047
+        return parts.joined(separator: "\r\n ")
     }
 
     /// Decodes a quoted-printable encoded string by removing "soft line" breaks and replacing all

@@ -27,7 +27,7 @@ extension Email {
             content += "Cc: \(self.ccRecipients.map { $0.description }.joined(separator: ", "))\r\n"
         }
 
-        content += "Subject: \(self.subject)\r\n"
+        content += "Subject: \(self.subject.rfc2047Encoded())\r\n"
         content += "Date: \(Self.rfc2822Date())\r\n"
         content += "Message-Id: <\(UUID().uuidString)@\(Self.senderDomain(from: self.sender))>\r\n"
         content += "MIME-Version: 1.0\r\n"

@@ -330,17 +330,21 @@ public actor SMTPServer {
             logger.warning("Attempted to disconnect when channel was already nil")
             return
         }
-        
-		// Use QuitCommand instead of directly sending a string
-		let quitCommand = QuitCommand()
-		
-		// Execute the QUIT command - it has its own timeout set to 10 seconds
-		try await executeCommand(quitCommand)
-        
-        // Close the channel regardless of QUIT command result
+
+		// Send QUIT command but don't let failures prevent channel cleanup.
+		// The channel MUST be closed regardless of QUIT success to avoid
+		// resource leaks and promise leaks on subsequent operations.
+		do {
+			let quitCommand = QuitCommand()
+			try await executeCommand(quitCommand)
+		} catch {
+			logger.debug("QUIT command failed during disconnect (non-fatal): \(error)")
+		}
+
+        // Always close the channel and clear state
         channel.close(promise: nil)
         self.channel = nil
-        
+
         logger.info("Disconnected from SMTP server")
     }
     
@@ -495,7 +499,11 @@ public actor SMTPServer {
 		} catch {
 			// Cancel the timeout
 			scheduledTask.cancel()
-			
+
+			// Fail the promise to prevent NIO "leaking promise" fatal errors.
+			// If the handler already completed the promise, this is a no-op.
+			resultPromise.fail(error)
+
 			// If it's a timeout error, throw a more specific error
 			if error is SMTPError {
 				throw error
