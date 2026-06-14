@@ -25,7 +25,15 @@ public struct MessagePart: Sendable {
 	
 	/// The content data (if any)
 	public var data: Data?
-	
+
+	/// The size of the part in octets as reported by the server's BODYSTRUCTURE,
+	/// in the encoded state (before any decoding). Available from `fetchStructure`
+	/// WITHOUT downloading the part's content, so it can be used to size-gate large
+	/// attachments before deciding whether to fetch them. `nil` when the part was not
+	/// built from a server BODYSTRUCTURE (e.g. constructed locally, or decoded from
+	/// data persisted before this field existed).
+	public let octetCount: Int?
+
 	/// Creates a new message part
 	/// - Parameters:
 	///   - section: The section number (e.g., [1, 2, 3] represents "1.2.3")
@@ -35,7 +43,8 @@ public struct MessagePart: Sendable {
 	///   - filename: The filename (if any)
 	///   - contentId: The content ID
 	///   - data: The content data (optional)
-	public init(section: Section, contentType: String, disposition: String? = nil, encoding: String? = nil, filename: String? = nil, contentId: String? = nil, data: Data? = nil) {
+	///   - octetCount: The BODYSTRUCTURE-reported size in octets (optional)
+	public init(section: Section, contentType: String, disposition: String? = nil, encoding: String? = nil, filename: String? = nil, contentId: String? = nil, data: Data? = nil, octetCount: Int? = nil) {
 		self.section = section
 		self.contentType = contentType
 		self.disposition = disposition
@@ -43,6 +52,7 @@ public struct MessagePart: Sendable {
 		self.filename = filename
 		self.contentId = contentId
 		self.data = data
+		self.octetCount = octetCount
 	}
 	
 	/// Initialize a new message part with a dot-separated string section number
@@ -53,7 +63,8 @@ public struct MessagePart: Sendable {
 	///   - filename: The filename
 	///   - contentId: The content ID
 	///   - data: The content data (optional)
-	public init(sectionString: String, contentType: String, disposition: String? = nil, encoding: String? = nil, filename: String? = nil, contentId: String? = nil, data: Data? = nil) {
+	///   - octetCount: The BODYSTRUCTURE-reported size in octets (optional)
+	public init(sectionString: String, contentType: String, disposition: String? = nil, encoding: String? = nil, filename: String? = nil, contentId: String? = nil, data: Data? = nil, octetCount: Int? = nil) {
 		self.section = Section(sectionString)
 		self.contentType = contentType
 		self.disposition = disposition
@@ -61,6 +72,7 @@ public struct MessagePart: Sendable {
 		self.filename = filename
 		self.contentId = contentId
 		self.data = data
+		self.octetCount = octetCount
 	}
 	
 	/// Get a suggested filename for the part
@@ -128,12 +140,12 @@ public struct MessagePart: Sendable {
 // MARK: - Codable Implementation
 extension MessagePart: Codable {
 	private enum CodingKeys: String, CodingKey {
-		case section, contentType, disposition, encoding, filename, contentId, data
+		case section, contentType, disposition, encoding, filename, contentId, data, octetCount
 	}
-	
+
 	public func encode(to encoder: Encoder) throws {
 		var container = encoder.container(keyedBy: CodingKeys.self)
-		
+
 		try container.encode(section, forKey: .section)
 		try container.encode(contentType, forKey: .contentType)
 		try container.encodeIfPresent(disposition, forKey: .disposition)
@@ -141,11 +153,12 @@ extension MessagePart: Codable {
 		try container.encodeIfPresent(filename, forKey: .filename)
 		try container.encodeIfPresent(contentId, forKey: .contentId)
 		try container.encodeIfPresent(data, forKey: .data)
+		try container.encodeIfPresent(octetCount, forKey: .octetCount)
 	}
-	
+
 	public init(from decoder: Decoder) throws {
 		let container = try decoder.container(keyedBy: CodingKeys.self)
-		
+
 		section = try container.decode(Section.self, forKey: .section)
 		contentType = try container.decode(String.self, forKey: .contentType)
 		disposition = try container.decodeIfPresent(String.self, forKey: .disposition)
@@ -153,5 +166,6 @@ extension MessagePart: Codable {
 		filename = try container.decodeIfPresent(String.self, forKey: .filename)
 		contentId = try container.decodeIfPresent(String.self, forKey: .contentId)
 		data = try container.decodeIfPresent(Data.self, forKey: .data)
+		octetCount = try container.decodeIfPresent(Int.self, forKey: .octetCount)
 	}
 }

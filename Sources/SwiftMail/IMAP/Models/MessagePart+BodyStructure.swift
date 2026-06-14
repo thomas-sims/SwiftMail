@@ -96,7 +96,9 @@ extension Array where Element == MessagePart {
                 return str.isEmpty ? nil : str
             } ?? nil
             
-            // Create a message part with empty data
+            // Create a message part with empty data. octetCount comes from the
+            // server's BODYSTRUCTURE (encoded size), so callers can size-gate large
+            // parts before deciding whether to fetch their content.
             let messagePart = MessagePart(
                 section: section,
                 contentType: contentType,
@@ -104,7 +106,8 @@ extension Array where Element == MessagePart {
                 encoding: encoding?.isEmpty == true ? nil : encoding,
                 filename: filename,
                 contentId: contentId,
-                data: nil
+                data: nil,
+                octetCount: part.fields.octetCount
             )
             
             // Append to our result
