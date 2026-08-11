@@ -30,7 +30,9 @@ struct StringEmailTests {
             "example-indeed@strange-example.com",
             "example@s.example",  // Short but valid domain
             "test.email.with+symbol@example.com",
-            "user123@test-domain.org"
+            "user123@test-domain.org",
+            "user@srv1.mail-tester.com",  // hyphen in a NON-first domain label (regression)
+            "name@mail.some-county.gov"   // hyphen in a mid label + multi-level subdomain
           ])
     func validEmails(email: String) {
         #expect(email.isValidEmail(), "'\(email)' should be a valid email address")
