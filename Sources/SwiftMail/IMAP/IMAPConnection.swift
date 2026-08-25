@@ -3,18 +3,30 @@ import Logging
 @preconcurrency import NIOIMAP
 import NIOIMAPCore
 import NIO
+import NIOConcurrencyHelpers
 import NIOSSL
 
 /// Internal connection wrapper used by IMAPServer to manage per-connection state.
 final class IMAPConnection {
+    private struct PendingConnect {
+        let id: UUID
+        let promise: EventLoopPromise<Channel>
+    }
+
+    private struct LifecycleState {
+        var channel: Channel?
+        var pendingConnect: PendingConnect?
+        var isRetired = false
+        var idleHandler: IdleHandler?
+        var idleTerminationInProgress = false
+    }
+
     private let host: String
     private let port: Int
     private let group: EventLoopGroup
-    private var channel: Channel?
+    private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
     private var capabilities: Set<NIOIMAPCore.Capability> = []
-    private var idleHandler: IdleHandler?
-    private var idleTerminationInProgress: Bool = false
     private let commandQueue = IMAPCommandQueue()
     private let responseBuffer = UntaggedResponseBuffer()
 
@@ -33,10 +45,9 @@ final class IMAPConnection {
     }
 
     var isConnected: Bool {
-        guard let channel = self.channel else {
-            return false
+        lifecycleState.withLockedValue { state in
+            state.channel?.isActive ?? false
         }
-        return channel.isActive
     }
 
     var capabilitiesSnapshot: Set<NIOIMAPCore.Capability> {
@@ -48,6 +59,8 @@ final class IMAPConnection {
     }
 
     func connect() async throws {
+        try ensureNotRetired()
+
         let sslContext = try NIOSSLContext(configuration: TLSConfiguration.makeClientConfiguration())
         let host = self.host
 
@@ -74,8 +87,33 @@ final class IMAPConnection {
                 return channel.eventLoop.makeSucceededFuture(())
             }
 
-        let channel = try await bootstrap.connect(host: host, port: port).get()
-        self.channel = channel
+        let connectFuture = bootstrap.connect(host: host, port: port)
+        let pendingConnect = PendingConnect(
+            id: UUID(),
+            promise: connectFuture.eventLoop.makePromise(of: Channel.self)
+        )
+        let registered = lifecycleState.withLockedValue { state in
+            guard !state.isRetired, state.pendingConnect == nil else {
+                return false
+            }
+            state.pendingConnect = pendingConnect
+            return true
+        }
+
+        guard registered else {
+            connectFuture.whenSuccess { channel in
+                channel.close(promise: nil)
+            }
+            try ensureNotRetired()
+            throw IMAPError.connectionFailed("Connection attempt already in progress")
+        }
+
+        let lifecycleState = self.lifecycleState
+        connectFuture.whenComplete { result in
+            Self.completePendingConnect(pendingConnect, with: result, lifecycleState: lifecycleState)
+        }
+
+        let channel = try await pendingConnect.promise.futureResult.get()
 
         // Add the persistent untagged response buffer as the LAST handler in the pipeline.
         // Transient command handlers are added BEFORE it (position: .before(responseBuffer)).
@@ -83,6 +121,8 @@ final class IMAPConnection {
         // fireChannelRead → buffer sees it. When no command handler is active, responses
         // flow directly to the buffer which captures them for later draining.
         try await channel.pipeline.addHandler(responseBuffer).get()
+
+        try ensureNotRetired()
 
         logger.info("Connected to IMAP server with 1MB buffer limit for large responses")
 
@@ -128,31 +168,55 @@ final class IMAPConnection {
             throw IMAPError.commandFailed("Failed to start IDLE session")
         }
 
-        try await commandQueue.run { [self] in
-            try await self.startIdleSession(continuation: continuation)
+        do {
+            try await commandQueue.run { [self] in
+                try await self.startIdleSession(continuation: continuation)
+            }
+        } catch {
+            continuation.finish()
+            throw error
         }
 
         return stream
     }
 
     func done() async throws {
-        guard let handler = idleHandler else {
+        let snapshot = lifecycleState.withLockedValue { state in
+            let shouldSendDone = !state.idleTerminationInProgress
+            if state.idleHandler != nil, shouldSendDone {
+                state.idleTerminationInProgress = true
+            }
+            return (state.idleHandler, state.channel, shouldSendDone)
+        }
+
+        guard let handler = snapshot.0 else {
             logger.debug("No active IDLE session, skipping DONE command")
             return
         }
 
-        guard let channel = self.channel else { return }
+        guard let channel = snapshot.1 else {
+            handler.abort()
+            lifecycleState.withLockedValue { state in
+                state.idleTerminationInProgress = false
+                if state.idleHandler === handler {
+                    state.idleHandler = nil
+                }
+            }
+            return
+        }
 
-        guard !idleTerminationInProgress else {
+        guard !snapshot.2 else {
             try await handler.promise.futureResult.get()
             return
         }
 
-        idleTerminationInProgress = true
-
         defer {
-            idleTerminationInProgress = false
-            idleHandler = nil
+            lifecycleState.withLockedValue { state in
+                state.idleTerminationInProgress = false
+                if state.idleHandler === handler {
+                    state.idleHandler = nil
+                }
+            }
             responseBuffer.hasActiveHandler = false
         }
 
@@ -240,13 +304,44 @@ final class IMAPConnection {
     }
 
     func disconnect() async throws {
-        guard let channel = self.channel else {
+        let channel = lifecycleState.withLockedValue { state -> Channel? in
+            let channel = state.channel
+            state.channel = nil
+            return channel
+        }
+
+        guard let channel else {
             logger.warning("Attempted to disconnect when channel was already nil")
             return
         }
 
-        channel.close(promise: nil)
-        self.channel = nil
+        try await channel.close(mode: CloseMode.all).get()
+        try await channel.closeFuture.get()
+    }
+
+    /// Permanently retire this connection and immediately tear down its transport.
+    /// No DONE or LOGOUT command is sent, and future commands cannot reconnect it.
+    func hardAbort() async {
+        let snapshot = lifecycleState.withLockedValue { state -> (Channel?, IdleHandler?, PendingConnect?) in
+            state.isRetired = true
+            let channel = state.channel
+            let idleHandler = state.idleHandler
+            let pendingConnect = state.pendingConnect
+            state.channel = nil
+            state.pendingConnect = nil
+            state.idleHandler = nil
+            state.idleTerminationInProgress = false
+            return (channel, idleHandler, pendingConnect)
+        }
+
+        await commandQueue.abort()
+        snapshot.1?.abort()
+        snapshot.2?.promise.fail(Self.abortedError)
+
+        if let channel = snapshot.0 {
+            try? await channel.close(mode: CloseMode.all).get()
+            try? await channel.closeFuture.get()
+        }
     }
 
     // MARK: - Private Helpers
@@ -260,6 +355,8 @@ final class IMAPConnection {
     }
 
     private func authenticateXOAUTH2Body(email: String, accessToken: String) async throws {
+        try ensureNotRetired()
+
         let mechanism = AuthenticationMechanism("XOAUTH2")
         let xoauthCapability = Capability.authenticate(mechanism)
 
@@ -271,12 +368,12 @@ final class IMAPConnection {
 
         clearInvalidChannel()
 
-        if self.channel == nil {
+        if currentChannel == nil {
             logger.info("Channel is nil, re-establishing connection before authentication")
             try await connect()
         }
 
-        guard let channel = self.channel else {
+        guard let channel = currentChannel else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
 
@@ -305,7 +402,7 @@ final class IMAPConnection {
         let logger = self.logger
         let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
             logger.warning("XOAUTH2 authentication timed out after \(authenticationTimeoutSeconds) seconds")
-            handlerPromise.fail(IMAPError.timeout)
+            handler.failWithError(IMAPError.timeout)
         }
 
         do {
@@ -324,40 +421,64 @@ final class IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-            if !handler.isCompleted {
-                try? await channel.pipeline.removeHandler(handler)
-            }
+            try? await channel.pipeline.removeHandler(handler)
 
             throw error
         }
     }
 
     private func startIdleSession(continuation: AsyncStream<IMAPServerEvent>.Continuation) async throws {
+        try ensureNotRetired()
+
         if !capabilities.contains(.idle) {
             throw IMAPError.commandNotSupported("IDLE command not supported by server")
         }
 
-        guard idleHandler == nil else {
+        let hasIdleHandler = lifecycleState.withLockedValue { state in
+            state.idleHandler != nil
+        }
+        guard !hasIdleHandler else {
             throw IMAPError.commandFailed("IDLE session already active")
         }
 
-        idleTerminationInProgress = false
-
-        guard let channel = self.channel else {
+        guard let channel = currentChannel else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
 
         let promise = channel.eventLoop.makePromise(of: Void.self)
         let tag = generateCommandTag()
         let handler = IdleHandler(commandTag: tag, promise: promise, continuation: continuation)
-        idleHandler = handler
+        let registered = lifecycleState.withLockedValue { state in
+            guard !state.isRetired, state.idleHandler == nil else {
+                return false
+            }
+            state.idleTerminationInProgress = false
+            state.idleHandler = handler
+            return true
+        }
 
-        try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
-        responseBuffer.hasActiveHandler = true
-        let command = IdleCommand()
-        let tagged = command.toTaggedCommand(tag: tag)
-        let wrapped = IMAPClientHandler.OutboundIn.part(CommandStreamPart.tagged(tagged))
-        try await channel.writeAndFlush(wrapped).get()
+        guard registered else {
+            handler.abort()
+            throw Self.abortedError
+        }
+
+        do {
+            try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
+            responseBuffer.hasActiveHandler = true
+            let command = IdleCommand()
+            let tagged = command.toTaggedCommand(tag: tag)
+            let wrapped = IMAPClientHandler.OutboundIn.part(CommandStreamPart.tagged(tagged))
+            try await channel.writeAndFlush(wrapped).get()
+        } catch {
+            lifecycleState.withLockedValue { state in
+                if state.idleHandler === handler {
+                    state.idleHandler = nil
+                }
+            }
+            handler.failWithError(error)
+            continuation.finish()
+            throw error
+        }
     }
 
     private func handleConnectionTerminationInResponses(_ untaggedResponses: [Response]) async {
@@ -376,7 +497,7 @@ final class IMAPConnection {
     }
 
     private func waitForIdleCompletionIfNeeded() async throws {
-        guard let handler = idleHandler else { return }
+        guard let handler = lifecycleState.withLockedValue({ $0.idleHandler }) else { return }
         try await handler.promise.futureResult.get()
     }
 
@@ -399,17 +520,18 @@ final class IMAPConnection {
     }
 
     private func executeCommandBody<CommandType: IMAPCommand>(_ command: CommandType) async throws -> CommandType.ResultType {
+        try ensureNotRetired()
         try command.validate()
         try await waitForIdleCompletionIfNeeded()
 
         clearInvalidChannel()
 
-        if self.channel == nil {
+        if currentChannel == nil {
             logger.info("Channel is nil, re-establishing connection before sending command")
             try await connect()
         }
 
-        guard let channel = self.channel else {
+        guard let channel = currentChannel else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
 
@@ -421,7 +543,7 @@ final class IMAPConnection {
         let logger = self.logger
         let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Command timed out after \(timeoutSeconds) seconds")
-            resultPromise.fail(IMAPError.timeout)
+            handler.failWithError(IMAPError.timeout)
         }
 
         do {
@@ -443,7 +565,8 @@ final class IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-            resultPromise.fail(error)
+            handler.failWithError(error)
+            try? await channel.pipeline.removeHandler(handler)
             throw error
         }
     }
@@ -452,14 +575,15 @@ final class IMAPConnection {
         handlerType: HandlerType.Type,
         timeoutSeconds: Int = 5
     ) async throws -> T where HandlerType.ResultType == T {
+        try ensureNotRetired()
         clearInvalidChannel()
 
-        if self.channel == nil {
+        if currentChannel == nil {
             logger.info("Channel is nil, re-establishing connection before executing handler")
             try await connect()
         }
 
-        guard let channel = self.channel else {
+        guard let channel = currentChannel else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
 
@@ -469,7 +593,7 @@ final class IMAPConnection {
         let logger = self.logger
         let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Handler execution timed out after \(timeoutSeconds) seconds")
-            resultPromise.fail(IMAPError.timeout)
+            handler.failWithError(IMAPError.timeout)
         }
 
         do {
@@ -490,16 +614,78 @@ final class IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-            resultPromise.fail(error)
+            handler.failWithError(error)
+            try? await channel.pipeline.removeHandler(handler)
             throw error
         }
     }
 
     private func clearInvalidChannel() {
-        if let channel = self.channel, !channel.isActive {
-            logger.info("Channel is no longer active, clearing channel reference")
-            self.channel = nil
+        let didClear = lifecycleState.withLockedValue { state in
+            if let channel = state.channel, !channel.isActive {
+                state.channel = nil
+                return true
+            }
+            return false
         }
+
+        if didClear {
+            logger.info("Channel is no longer active, clearing channel reference")
+        }
+    }
+
+    private static func completePendingConnect(
+        _ pendingConnect: PendingConnect,
+        with result: Result<Channel, Error>,
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) {
+        switch result {
+        case .success(let channel):
+            let shouldAdopt = lifecycleState.withLockedValue { state in
+                guard state.pendingConnect?.id == pendingConnect.id else {
+                    return false
+                }
+
+                state.pendingConnect = nil
+                guard !state.isRetired else { return false }
+                state.channel = channel
+                return true
+            }
+
+            if shouldAdopt {
+                pendingConnect.promise.succeed(channel)
+            } else {
+                channel.close(promise: nil)
+            }
+
+        case .failure(let error):
+            let shouldFail = lifecycleState.withLockedValue { state in
+                guard state.pendingConnect?.id == pendingConnect.id else {
+                    return false
+                }
+                state.pendingConnect = nil
+                return true
+            }
+
+            if shouldFail {
+                pendingConnect.promise.fail(error)
+            }
+        }
+    }
+
+    private var currentChannel: Channel? {
+        lifecycleState.withLockedValue { $0.channel }
+    }
+
+    private func ensureNotRetired() throws {
+        let isRetired = lifecycleState.withLockedValue { $0.isRetired }
+        if isRetired {
+            throw Self.abortedError
+        }
+    }
+
+    private static var abortedError: IMAPError {
+        IMAPError.connectionFailed("Connection was aborted")
     }
 
     private func generateCommandTag() -> String {

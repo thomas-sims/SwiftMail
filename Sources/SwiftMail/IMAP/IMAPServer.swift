@@ -44,6 +44,11 @@ public actor IMAPServer {
 
     /// Authentication configuration for spawning new connections.
     private var authentication: Authentication?
+
+    /// A hard-aborted server is terminal. Create a new server to reconnect.
+    private var isRetired = false
+    private var isHardAbortInProgress = false
+    private var hardAbortWaiters: [CheckedContinuation<Void, Never>] = []
     
     /** The list of all mailboxes with their attributes */
     public private(set) var mailboxes: [Mailbox.Info] = []
@@ -144,6 +149,7 @@ public actor IMAPServer {
      - Note: Logs connection attempts and capability retrieval at info level
      */
     public func connect() async throws {
+        try ensureNotRetired()
         try await primaryConnection.connect()
     }
     
@@ -222,10 +228,11 @@ public actor IMAPServer {
     }
     
     /**
-     Disconnect from the server without sending a command
+     Disconnect from the server without sending LOGOUT
      
-     This method immediately closes the connection to the server without sending
-     a LOGOUT command. For a graceful disconnect, use logout() instead.
+     This method first asks active IDLE sessions to finish with `DONE`, then closes
+     their transports without sending `LOGOUT`. Use ``hardAbort()`` when waiting
+     for an IDLE response is unsafe; use ``logout()`` for a graceful logout.
      
      - Throws: An error if the disconnection fails
      - Note: Logs disconnection at debug level
@@ -233,6 +240,43 @@ public actor IMAPServer {
     public func disconnect() async throws
     {
         try await closeAllConnections()
+    }
+
+    /// Immediately and permanently abort every connection owned by this server.
+    ///
+    /// Unlike ``disconnect()``, this method never waits for IDLE `DONE` or IMAP
+    /// `LOGOUT` responses. It retires the current server first, rejects queued and
+    /// future commands, closes the primary and dedicated IDLE transports, and
+    /// waits for those channels to finish closing. Create a new `IMAPServer` to
+    /// reconnect after calling this method.
+    public func hardAbort() async {
+        if isHardAbortInProgress {
+            await withCheckedContinuation { continuation in
+                hardAbortWaiters.append(continuation)
+            }
+            return
+        }
+
+        guard !isRetired else { return }
+
+        isRetired = true
+        isHardAbortInProgress = true
+        authentication = nil
+
+        let idleEntries = idleConnections
+        idleConnections.removeAll()
+
+        await primaryConnection.hardAbort()
+        for entry in idleEntries.values {
+            await entry.connection.hardAbort()
+        }
+
+        isHardAbortInProgress = false
+        let waiters = hardAbortWaiters
+        hardAbortWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     // MARK: - Connection Management
@@ -394,6 +438,7 @@ public actor IMAPServer {
     /// - Parameter mailbox: The mailbox to watch for changes.
     /// - Parameter cycleInterval: Seconds between IDLE cycles (default 240 = 4 minutes).
     public func idle(on mailbox: String, cycleInterval: TimeInterval = 240) async throws -> IMAPIdleSession {
+        try ensureNotRetired()
         guard let authentication = authentication else {
             throw IMAPError.commandFailed("Authentication required before starting IDLE on a mailbox")
         }
@@ -537,7 +582,7 @@ public actor IMAPServer {
      Logout from the IMAP server
      
      This method performs a clean logout from the server by sending the LOGOUT command
-     and closing the connection. For an immediate disconnect, use disconnect() instead.
+     and closing the connection. For an immediate terminal close, use ``hardAbort()``.
      
      - Throws:
      - `IMAPError.logoutFailed` if the logout fails
@@ -1106,6 +1151,12 @@ public actor IMAPServer {
      */
     private func executeCommand<CommandType: IMAPCommand>(_ command: CommandType) async throws -> CommandType.ResultType {
         try await primaryConnection.executeCommand(command)
+    }
+
+    private func ensureNotRetired() throws {
+        if isRetired {
+            throw IMAPError.connectionFailed("Connection was aborted")
+        }
     }
 
     private func append(rawMessage: String, to mailbox: String, flags: [Flag], internalDate: Date?) async throws -> AppendResult {

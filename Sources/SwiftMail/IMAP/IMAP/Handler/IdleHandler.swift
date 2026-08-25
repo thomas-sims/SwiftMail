@@ -35,6 +35,24 @@ final class IdleHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unch
         continuation.finish()
     }
 
+    func abort() {
+        let error = IMAPError.connectionFailed("Connection was aborted")
+        if failWithError(error) {
+            handleChannelTermination(error: error)
+        }
+    }
+
+    override func handleChannelTermination(error: Error) {
+        continuation.yield(.bye("Connection closed"))
+        continuation.finish()
+    }
+
+    override func handleError(_ error: Error) {
+        if failWithError(error) {
+            continuation.finish()
+        }
+    }
+
     private var currentSeq: SequenceNumber?
     private var currentUID: UID?
     private var currentAttributes: [MessageAttribute] = []

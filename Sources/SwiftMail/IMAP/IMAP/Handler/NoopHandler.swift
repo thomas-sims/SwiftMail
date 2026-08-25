@@ -38,7 +38,7 @@ final class NoopHandler: BaseIMAPCommandHandler<[IMAPServerEvent]>, IMAPCommandH
            case .conditionalState(let status) = payload,
            case .bye(let text) = status {
             events.append(.bye(text.text))
-            return true  // Indicate we handled this BYE
+            return super.handleUntaggedResponse(response)
         }
         
         // Let base class handle other untagged responses

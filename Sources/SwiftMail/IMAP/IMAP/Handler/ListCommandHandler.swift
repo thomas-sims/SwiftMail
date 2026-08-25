@@ -36,7 +36,7 @@ final class ListCommandHandler: BaseIMAPCommandHandler<[Mailbox.Info]>, IMAPComm
     }
     
 	override func errorCaught(context: ChannelHandlerContext, error: Error) {
-        promise.fail(error)
+        failWithError(error)
         context.fireErrorCaught(error)
     }
     
@@ -45,9 +45,9 @@ final class ListCommandHandler: BaseIMAPCommandHandler<[Mailbox.Info]>, IMAPComm
         case .ok:
             // Convert NIOIMAPCore.MailboxInfo to our Mailbox.Info
             let convertedMailboxes = mailboxes.map { Mailbox.Info(nio: $0) }
-            promise.succeed(convertedMailboxes)
+            succeedWithResult(convertedMailboxes)
         case .no, .bad:
-            promise.fail(IMAPError.commandFailed("List command failed"))
+            failWithError(IMAPError.commandFailed("List command failed"))
         }
     }
 } 

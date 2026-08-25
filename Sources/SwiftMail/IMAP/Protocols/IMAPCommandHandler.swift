@@ -8,7 +8,7 @@ import Logging
 import NIOIMAPCore
 
 /// Protocol for IMAP command handlers
-protocol IMAPCommandHandler: ChannelInboundHandler, Sendable where ResultType: Sendable {
+protocol IMAPCommandHandler: ChannelInboundHandler, RemovableChannelHandler, Sendable where ResultType: Sendable {
     associatedtype ResultType
     
     /// Initialize the handler
@@ -19,4 +19,8 @@ protocol IMAPCommandHandler: ChannelInboundHandler, Sendable where ResultType: S
     
     /// Get the untagged responses collected during command execution
     var untaggedResponses: [Response] { get }
+
+    /// Fail the command if it has not already completed.
+    @discardableResult
+    func failWithError(_ error: Error) -> Bool
 }

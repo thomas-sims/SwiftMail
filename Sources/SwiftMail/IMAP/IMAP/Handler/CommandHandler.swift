@@ -31,7 +31,11 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
     let commandTag: String?
     
     /// Whether this handler has completed processing
-    private(set) var isCompleted: Bool = false
+    private var _isCompleted: Bool = false
+
+    var isCompleted: Bool {
+        lock.withLock { _isCompleted }
+    }
     
     	/// Lock for thread-safe access to mutable properties
 	let lock = NIOLock()
@@ -60,24 +64,26 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
     /// Handle the completion of this command
     /// - Parameter context: The channel handler context
     func handleCompletion(context: ChannelHandlerContext) {
-        lock.withLock {
-            isCompleted = true
+        if !isCompleted {
+            failWithError(IMAPError.commandFailed("Handler completed without resolving its command"))
         }
-        
+
         // Remove this handler from the pipeline
         context.pipeline.removeHandler(self, promise: nil)
     }
     
     /// Succeed the promise with a result
     /// - Parameter result: The result to succeed with
-    func succeedWithResult(_ result: ResultType) {
-        promise.succeed(result)
+    @discardableResult
+    func succeedWithResult(_ result: ResultType) -> Bool {
+        completePromise(with: .success(result))
     }
     
     /// Fail the promise with an error
     /// - Parameter error: The error to fail with
-    func failWithError(_ error: Error) {
-        promise.fail(error)
+    @discardableResult
+    func failWithError(_ error: Error) -> Bool {
+        completePromise(with: .failure(error))
     }
     
     /// Process an incoming response
@@ -191,11 +197,36 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
         // Forward the error to the next handler
         context.fireErrorCaught(error)
     }
+
+    /// Complete an outstanding command when its transport disappears. NIO does
+    /// not otherwise resolve command promises merely because a channel closed.
+    func channelInactive(context: ChannelHandlerContext) {
+        let error = IMAPConnectionError.disconnected
+        if failWithError(error) {
+            handleChannelTermination(error: error)
+        }
+        context.fireChannelInactive()
+    }
     
     /// Handle an error
     /// This method should be overridden by subclasses
     func handleError(_ error: Error) {
         // Fail the promise with the error
         failWithError(error)
+    }
+
+    /// Hook for handlers that own resources in addition to their result promise.
+    func handleChannelTermination(error: Error) {}
+
+    private func completePromise(with result: Result<ResultType, Error>) -> Bool {
+        let shouldComplete = lock.withLock {
+            guard !_isCompleted else { return false }
+            _isCompleted = true
+            return true
+        }
+
+        guard shouldComplete else { return false }
+        promise.completeWith(result)
+        return true
     }
 } 
