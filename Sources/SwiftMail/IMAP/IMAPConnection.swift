@@ -8,13 +8,20 @@ import NIOSSL
 
 /// Internal connection wrapper used by IMAPServer to manage per-connection state.
 final class IMAPConnection {
+    typealias ConnectOverride = (@escaping @Sendable (Channel) -> Void) -> EventLoopFuture<Channel>
+
     private struct PendingConnect {
         let id: UUID
         let promise: EventLoopPromise<Channel>
+        let transportFuture: EventLoopFuture<Channel>
     }
 
     private struct LifecycleState {
         var channel: Channel?
+        /// Every channel created for this connection, including Happy-Eyeballs
+        /// candidates that have not won yet and channels that are closing.
+        /// Entries are removed only by their `closeFuture` callback.
+        var ownedChannels: [ObjectIdentifier: Channel] = [:]
         var pendingConnect: PendingConnect?
         var isRetired = false
         var idleHandler: IdleHandler?
@@ -24,6 +31,7 @@ final class IMAPConnection {
     private let host: String
     private let port: Int
     private let group: EventLoopGroup
+    private let connectOverride: ConnectOverride?
     private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
     private var capabilities: Set<NIOIMAPCore.Capability> = []
@@ -33,10 +41,19 @@ final class IMAPConnection {
     private let logger: Logging.Logger
     private let duplexLogger: IMAPLogger
 
-    init(host: String, port: Int, group: EventLoopGroup, loggerLabel: String, outboundLabel: String, inboundLabel: String) {
+    init(
+        host: String,
+        port: Int,
+        group: EventLoopGroup,
+        loggerLabel: String,
+        outboundLabel: String,
+        inboundLabel: String,
+        connectOverride: ConnectOverride? = nil
+    ) {
         self.host = host
         self.port = port
         self.group = group
+        self.connectOverride = connectOverride
 
         self.logger = Logging.Logger(label: loggerLabel)
         let outboundLogger = Logging.Logger(label: outboundLabel)
@@ -64,33 +81,56 @@ final class IMAPConnection {
         let sslContext = try NIOSSLContext(configuration: TLSConfiguration.makeClientConfiguration())
         let host = self.host
 
-        let duplexLogger = self.duplexLogger
-        let bootstrap = ClientBootstrap(group: group)
-            .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
-            .channelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: 1)
-            .channelInitializer { channel in
-                let sslHandler = try! NIOSSLClientHandler(context: sslContext, serverHostname: host)
+        let lifecycleState = self.lifecycleState
+        let registerChannel: @Sendable (Channel) -> Void = { channel in
+            Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
+        }
 
-                let parserOptions = ResponseParser.Options(
-                    bufferLimit: 1024 * 1024,
-                    messageAttributeLimit: .max,
-                    bodySizeLimit: .max,
-                    literalSizeLimit: IMAPDefaults.literalSizeLimit
-                )
+        let connectFuture: EventLoopFuture<Channel>
+        if let connectOverride {
+            connectFuture = connectOverride(registerChannel)
+        } else {
+            let duplexLogger = self.duplexLogger
+            connectFuture = ClientBootstrap(group: group)
+                // Make the NIO-owned Happy-Eyeballs attempt explicitly bounded.
+                // Hard abort additionally closes every candidate surfaced through
+                // the initializer and awaits this underlying future.
+                .connectTimeout(.seconds(10))
+                .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+                .channelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: 1)
+                .channelInitializer { channel in
+                    registerChannel(channel)
 
-                try! channel.pipeline.syncOperations.addHandlers([
-                    sslHandler,
-                    IMAPClientHandler(parserOptions: parserOptions),
-                    duplexLogger
-                ])
+                    let accepted = lifecycleState.withLockedValue { !$0.isRetired }
+                    guard accepted else {
+                        return channel.close(mode: .all).flatMapThrowing {
+                            throw Self.abortedError
+                        }
+                    }
 
-                return channel.eventLoop.makeSucceededFuture(())
-            }
+                    let sslHandler = try! NIOSSLClientHandler(context: sslContext, serverHostname: host)
 
-        let connectFuture = bootstrap.connect(host: host, port: port)
+                    let parserOptions = ResponseParser.Options(
+                        bufferLimit: 1024 * 1024,
+                        messageAttributeLimit: .max,
+                        bodySizeLimit: .max,
+                        literalSizeLimit: IMAPDefaults.literalSizeLimit
+                    )
+
+                    try! channel.pipeline.syncOperations.addHandlers([
+                        sslHandler,
+                        IMAPClientHandler(parserOptions: parserOptions),
+                        duplexLogger
+                    ])
+
+                    return channel.eventLoop.makeSucceededFuture(())
+                }
+                .connect(host: host, port: port)
+        }
         let pendingConnect = PendingConnect(
             id: UUID(),
-            promise: connectFuture.eventLoop.makePromise(of: Channel.self)
+            promise: connectFuture.eventLoop.makePromise(of: Channel.self),
+            transportFuture: connectFuture
         )
         let registered = lifecycleState.withLockedValue { state in
             guard !state.isRetired, state.pendingConnect == nil else {
@@ -108,7 +148,6 @@ final class IMAPConnection {
             throw IMAPError.connectionFailed("Connection attempt already in progress")
         }
 
-        let lifecycleState = self.lifecycleState
         connectFuture.whenComplete { result in
             Self.completePendingConnect(pendingConnect, with: result, lifecycleState: lifecycleState)
         }
@@ -304,44 +343,64 @@ final class IMAPConnection {
     }
 
     func disconnect() async throws {
-        let channel = lifecycleState.withLockedValue { state -> Channel? in
-            let channel = state.channel
-            state.channel = nil
-            return channel
-        }
+        let channels = lifecycleState.withLockedValue { Array($0.ownedChannels.values) }
 
-        guard let channel else {
+        guard !channels.isEmpty else {
             logger.warning("Attempted to disconnect when channel was already nil")
             return
         }
 
-        try await channel.close(mode: CloseMode.all).get()
-        try await channel.closeFuture.get()
+        for channel in channels {
+            channel.close(mode: CloseMode.all, promise: nil)
+        }
+        for channel in channels {
+            try await channel.closeFuture.get()
+        }
     }
 
     /// Permanently retire this connection and immediately tear down its transport.
     /// No DONE or LOGOUT command is sent, and future commands cannot reconnect it.
     func hardAbort() async {
-        let snapshot = lifecycleState.withLockedValue { state -> (Channel?, IdleHandler?, PendingConnect?) in
+        let snapshot = lifecycleState.withLockedValue { state -> (didRetire: Bool, channels: [Channel], idleHandler: IdleHandler?, pendingConnect: PendingConnect?) in
+            let didRetire = !state.isRetired
             state.isRetired = true
-            let channel = state.channel
             let idleHandler = state.idleHandler
-            let pendingConnect = state.pendingConnect
             state.channel = nil
-            state.pendingConnect = nil
             state.idleHandler = nil
             state.idleTerminationInProgress = false
-            return (channel, idleHandler, pendingConnect)
+            return (didRetire, Array(state.ownedChannels.values), idleHandler, state.pendingConnect)
         }
 
         await commandQueue.abort()
-        snapshot.1?.abort()
-        snapshot.2?.promise.fail(Self.abortedError)
+        responseBuffer.hasActiveHandler = false
+        snapshot.idleHandler?.abort()
+        if snapshot.didRetire {
+            snapshot.pendingConnect?.promise.fail(Self.abortedError)
+        }
 
-        if let channel = snapshot.0 {
-            try? await channel.close(mode: CloseMode.all).get()
+        // Close every channel the bootstrap has surfaced, including losing
+        // Happy-Eyeballs candidates and channels already in graceful teardown.
+        // Issue all closes before awaiting any one close so one slow transport
+        // cannot postpone retirement of its siblings.
+        for channel in snapshot.channels {
+            channel.close(mode: CloseMode.all, promise: nil)
+        }
+        for channel in snapshot.channels {
             try? await channel.closeFuture.get()
         }
+
+        // Failing the public wrapper promise is not transport cancellation.
+        // Wait for NIO's actual ClientBootstrap/Happy-Eyeballs attempt to
+        // resolve after its candidate channels were closed. Its explicit
+        // connect timeout bounds the no-candidate/DNS portion.
+        if let pendingConnect = snapshot.pendingConnect {
+            _ = try? await pendingConnect.transportFuture.get()
+        }
+
+        // A candidate can be initialized concurrently with the first snapshot.
+        // The retired registration path closes it immediately; this final drain
+        // observes and awaits that late channel before hardAbort returns.
+        await closeRemainingOwnedChannels()
     }
 
     // MARK: - Private Helpers
@@ -427,7 +486,7 @@ final class IMAPConnection {
         }
     }
 
-    private func startIdleSession(continuation: AsyncStream<IMAPServerEvent>.Continuation) async throws {
+    func startIdleSession(continuation: AsyncStream<IMAPServerEvent>.Continuation) async throws {
         try ensureNotRetired()
 
         if !capabilities.contains(.idle) {
@@ -462,8 +521,10 @@ final class IMAPConnection {
             throw Self.abortedError
         }
 
+        var handlerInstalled = false
         do {
             try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
+            handlerInstalled = true
             responseBuffer.hasActiveHandler = true
             let command = IdleCommand()
             let tagged = command.toTaggedCommand(tag: tag)
@@ -474,9 +535,14 @@ final class IMAPConnection {
                 if state.idleHandler === handler {
                     state.idleHandler = nil
                 }
+                state.idleTerminationInProgress = false
             }
+            responseBuffer.hasActiveHandler = false
             handler.failWithError(error)
             continuation.finish()
+            if handlerInstalled {
+                try? await channel.pipeline.removeHandler(handler)
+            }
             throw error
         }
     }
@@ -634,6 +700,48 @@ final class IMAPConnection {
         }
     }
 
+    /// Register a transport at channel-initializer time, before TCP/TLS has
+    /// succeeded. This is the authoritative ownership boundary for abort: a
+    /// channel remains present until its closeFuture fires, even if it never
+    /// becomes the selected connection or graceful close has already begun.
+    private static func registerOwnedChannel(
+        _ channel: Channel,
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) {
+        let identifier = ObjectIdentifier(channel)
+        let shouldClose = lifecycleState.withLockedValue { state -> Bool in
+            state.ownedChannels[identifier] = channel
+            return state.isRetired
+        }
+
+        channel.closeFuture.whenComplete { _ in
+            lifecycleState.withLockedValue { state in
+                state.ownedChannels.removeValue(forKey: identifier)
+                if let active = state.channel, active === channel {
+                    state.channel = nil
+                }
+            }
+        }
+
+        if shouldClose {
+            channel.close(mode: CloseMode.all, promise: nil)
+        }
+    }
+
+    private func closeRemainingOwnedChannels() async {
+        while true {
+            let channels = lifecycleState.withLockedValue { Array($0.ownedChannels.values) }
+            guard !channels.isEmpty else { return }
+
+            for channel in channels {
+                channel.close(mode: CloseMode.all, promise: nil)
+            }
+            for channel in channels {
+                try? await channel.closeFuture.get()
+            }
+        }
+    }
+
     private static func completePendingConnect(
         _ pendingConnect: PendingConnect,
         with result: Result<Channel, Error>,
@@ -664,13 +772,65 @@ final class IMAPConnection {
                     return false
                 }
                 state.pendingConnect = nil
-                return true
+                return !state.isRetired
             }
 
             if shouldFail {
                 pendingConnect.promise.fail(error)
             }
         }
+    }
+
+    // Internal lifecycle observability used by deterministic package tests.
+    // These expose only counts/booleans, never hosts, mailbox data, or secrets.
+    var ownedTransportCount: Int {
+        lifecycleState.withLockedValue { $0.ownedChannels.count }
+    }
+
+    var hasPendingTransportConnect: Bool {
+        lifecycleState.withLockedValue { $0.pendingConnect != nil }
+    }
+
+    var hasIdleHandler: Bool {
+        lifecycleState.withLockedValue { $0.idleHandler != nil }
+    }
+
+    var hasActiveResponseHandler: Bool {
+        responseBuffer.hasActiveHandler
+    }
+
+    func hasInstalledIdleHandler() async -> Bool {
+        guard let channel = currentChannel else { return false }
+        return (try? await channel.eventLoop.submit {
+            do {
+                _ = try channel.pipeline.syncOperations.context(handlerType: IdleHandler.self)
+                return true
+            } catch {
+                return false
+            }
+        }.get()) ?? false
+    }
+
+    /// Installs an already-created channel at the same ownership and pipeline
+    /// boundary used by `connect()`. Internal so package tests can deterministically
+    /// exercise IDLE teardown without an external TLS server.
+    func prepareEstablishedChannel(
+        _ channel: Channel,
+        capabilities: Set<NIOIMAPCore.Capability> = []
+    ) async throws {
+        Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
+        let adopted = lifecycleState.withLockedValue { state -> Bool in
+            guard !state.isRetired else { return false }
+            state.channel = channel
+            return true
+        }
+        guard adopted else {
+            channel.close(mode: .all, promise: nil)
+            throw Self.abortedError
+        }
+
+        try await channel.pipeline.addHandler(responseBuffer).get()
+        self.capabilities = capabilities
     }
 
     private var currentChannel: Channel? {

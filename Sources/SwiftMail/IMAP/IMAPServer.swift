@@ -47,6 +47,7 @@ public actor IMAPServer {
 
     /// A hard-aborted server is terminal. Create a new server to reconnect.
     private var isRetired = false
+    private var isClosingConnections = false
     private var isHardAbortInProgress = false
     private var hardAbortWaiters: [CheckedContinuation<Void, Never>] = []
     
@@ -74,8 +75,16 @@ public actor IMAPServer {
     private let logger: Logging.Logger
     
     private struct IdleConnection {
+        enum State {
+            case active
+            case gracefullyClosing
+        }
+
         let mailbox: String
         let connection: IMAPConnection
+        var state: State = .active
+        var cycleTask: Task<Void, Never>?
+        var continuation: AsyncStream<IMAPServerEvent>.Continuation?
     }
 
     private enum Authentication {
@@ -263,12 +272,38 @@ public actor IMAPServer {
         isHardAbortInProgress = true
         authentication = nil
 
+        // Snapshot without removing: this dictionary is the authoritative
+        // ownership registry. Gracefully-closing entries stay visible until
+        // their transports are actually closed, so a concurrent hard abort
+        // cannot miss a connection wedged while waiting for IDLE DONE.
         let idleEntries = idleConnections
-        idleConnections.removeAll()
+        let connections = [primaryConnection] + idleEntries.values.map(\.connection)
 
-        await primaryConnection.hardAbort()
+        for (id, entry) in idleEntries {
+            entry.continuation?.finish()
+            entry.cycleTask?.cancel()
+            if var current = idleConnections[id], current.connection === entry.connection {
+                current.state = .gracefullyClosing
+                current.continuation = nil
+                idleConnections[id] = current
+            }
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            for connection in connections {
+                group.addTask {
+                    await connection.hardAbort()
+                }
+            }
+        }
+
         for entry in idleEntries.values {
-            await entry.connection.hardAbort()
+            await entry.cycleTask?.value
+        }
+
+        for (id, entry) in idleEntries {
+            markIdleRuntimeStopped(id: id, matching: entry.connection)
+            removeIdleConnectionIfClosed(id: id, matching: entry.connection)
         }
 
         isHardAbortInProgress = false
@@ -299,29 +334,115 @@ public actor IMAPServer {
         )
     }
 
-    private func endIdleSession(id: UUID) async throws {
-        guard let entry = idleConnections.removeValue(forKey: id) else { return }
+    func trackIdleConnection(id: UUID, mailbox: String, connection: IMAPConnection) {
+        idleConnections[id] = IdleConnection(mailbox: mailbox, connection: connection)
+    }
+
+    func attachIdleRuntime(
+        id: UUID,
+        matching connection: IMAPConnection,
+        cycleTask: Task<Void, Never>,
+        continuation: AsyncStream<IMAPServerEvent>.Continuation
+    ) throws {
+        guard !isRetired, !isClosingConnections,
+              var entry = idleConnections[id],
+              entry.connection === connection,
+              entry.state == .active else {
+            cycleTask.cancel()
+            continuation.finish()
+            throw IMAPError.connectionFailed("Connection teardown in progress")
+        }
+        entry.cycleTask = cycleTask
+        entry.continuation = continuation
+        idleConnections[id] = entry
+    }
+
+    var trackedIdleConnectionCount: Int {
+        idleConnections.count
+    }
+
+    var trackedIdleTaskCount: Int {
+        idleConnections.values.reduce(into: 0) { count, entry in
+            if entry.cycleTask != nil { count += 1 }
+        }
+    }
+
+    var gracefullyClosingIdleConnectionCount: Int {
+        idleConnections.values.reduce(into: 0) { count, entry in
+            if entry.state == .gracefullyClosing { count += 1 }
+        }
+    }
+
+    func endIdleSession(id: UUID) async throws {
+        guard var entry = idleConnections[id] else { return }
+        entry.state = .gracefullyClosing
+        entry.continuation?.finish()
+        entry.continuation = nil
+        entry.cycleTask?.cancel()
+        idleConnections[id] = entry
 
         do {
             try await entry.connection.done()
             try await entry.connection.disconnect()
+            await entry.cycleTask?.value
+            markIdleRuntimeStopped(id: id, matching: entry.connection)
+            removeIdleConnectionIfClosed(id: id, matching: entry.connection)
         } catch {
             try? await entry.connection.disconnect()
+            await entry.cycleTask?.value
+            markIdleRuntimeStopped(id: id, matching: entry.connection)
+            removeIdleConnectionIfClosed(id: id, matching: entry.connection)
             throw error
         }
     }
 
     private func closeAllConnections() async throws {
+        guard !isClosingConnections else {
+            throw IMAPError.connectionFailed("Connection teardown already in progress")
+        }
+        isClosingConnections = true
+        defer { isClosingConnections = false }
+
         let idleEntries = idleConnections
-        idleConnections.removeAll()
+
+        for (id, var entry) in idleEntries {
+            entry.state = .gracefullyClosing
+            entry.continuation?.finish()
+            entry.continuation = nil
+            entry.cycleTask?.cancel()
+            idleConnections[id] = entry
+        }
 
         for entry in idleEntries.values {
             try? await entry.connection.done()
             try? await entry.connection.disconnect()
         }
 
+        for entry in idleEntries.values {
+            await entry.cycleTask?.value
+        }
+
+        for (id, entry) in idleEntries {
+            markIdleRuntimeStopped(id: id, matching: entry.connection)
+            removeIdleConnectionIfClosed(id: id, matching: entry.connection)
+        }
+
         try? await primaryConnection.done()
         try await primaryConnection.disconnect()
+    }
+
+    private func removeIdleConnectionIfClosed(id: UUID, matching connection: IMAPConnection) {
+        guard let current = idleConnections[id], current.connection === connection else { return }
+        guard connection.ownedTransportCount == 0 else { return }
+        guard current.cycleTask == nil else { return }
+        idleConnections.removeValue(forKey: id)
+    }
+
+    private func markIdleRuntimeStopped(id: UUID, matching connection: IMAPConnection) {
+        guard var current = idleConnections[id], current.connection === connection else { return }
+        current.cycleTask = nil
+        current.continuation = nil
+        idleConnections[id] = current
     }
     
     // MARK: - Mailbox Commands
@@ -439,18 +560,28 @@ public actor IMAPServer {
     /// - Parameter cycleInterval: Seconds between IDLE cycles (default 240 = 4 minutes).
     public func idle(on mailbox: String, cycleInterval: TimeInterval = 240) async throws -> IMAPIdleSession {
         try ensureNotRetired()
+        guard !isClosingConnections else {
+            throw IMAPError.connectionFailed("Connection teardown in progress")
+        }
         guard let authentication = authentication else {
             throw IMAPError.commandFailed("Authentication required before starting IDLE on a mailbox")
         }
 
         let sessionID = UUID()
         let connection = makeIdleConnection(sessionID: sessionID)
-        idleConnections[sessionID] = IdleConnection(mailbox: mailbox, connection: connection)
+        trackIdleConnection(id: sessionID, mailbox: mailbox, connection: connection)
 
         do {
             try await connection.connect()
             try await authentication.authenticate(on: connection)
             _ = try await connection.executeCommand(SelectMailboxCommand(mailboxName: mailbox))
+            try ensureNotRetired()
+            guard !isClosingConnections,
+                  let entry = idleConnections[sessionID],
+                  entry.connection === connection,
+                  entry.state == .active else {
+                throw IMAPError.connectionFailed("Connection teardown in progress")
+            }
 
             // Create a wrapper stream that we control
             var continuationRef: AsyncStream<IMAPServerEvent>.Continuation!
@@ -548,6 +679,13 @@ public actor IMAPServer {
                 continuation.finish()
             }
 
+            try attachIdleRuntime(
+                id: sessionID,
+                matching: connection,
+                cycleTask: cycleTask,
+                continuation: continuation
+            )
+
             let session = IMAPIdleSession(events: wrappedEvents) { [weak self] in
                 cycleTask.cancel()
                 guard let self else { return }
@@ -556,8 +694,12 @@ public actor IMAPServer {
 
             return session
         } catch {
-            idleConnections[sessionID] = nil
+            if var entry = idleConnections[sessionID], entry.connection === connection {
+                entry.state = .gracefullyClosing
+                idleConnections[sessionID] = entry
+            }
             try? await connection.disconnect()
+            removeIdleConnectionIfClosed(id: sessionID, matching: connection)
             throw error
         }
     }

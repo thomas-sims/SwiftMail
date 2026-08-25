@@ -1,6 +1,7 @@
 import Foundation
 import NIO
 import NIOEmbedded
+@preconcurrency import NIOIMAP
 import Testing
 @testable import SwiftMail
 
@@ -279,6 +280,224 @@ struct IMAPAbortTests {
         #expect(await queue.pendingCount == 0)
         #expect(await entries.count == 0)
     }
+
+    @Test
+    func hardAbortOwnsGracefullyClosingIdleConnectionAndCycleTask() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+
+        var continuationReference: AsyncStream<IMAPServerEvent>.Continuation?
+        let stream = AsyncStream<IMAPServerEvent> { continuation in
+            continuationReference = continuation
+        }
+        let continuation = try #require(continuationReference)
+        try await connection.startIdleSession(continuation: continuation)
+
+        let cycleTask = Task<Void, Never> {
+            for await _ in stream {}
+        }
+        let server = IMAPServer(host: "invalid.invalid", port: 993)
+        let sessionID = UUID()
+        await server.trackIdleConnection(id: sessionID, mailbox: "INBOX", connection: connection)
+        try await server.attachIdleRuntime(
+            id: sessionID,
+            matching: connection,
+            cycleTask: cycleTask,
+            continuation: continuation
+        )
+
+        let gracefulClose = Task {
+            try await server.endIdleSession(id: sessionID)
+        }
+        try await waitUntil {
+            await server.gracefullyClosingIdleConnectionCount == 1
+        }
+
+        #expect(await server.trackedIdleConnectionCount == 1)
+        #expect(await server.trackedIdleTaskCount == 1)
+        #expect(connection.ownedTransportCount == 1)
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await withTaskGroup(of: Void.self) { aborts in
+            for _ in 0..<8 {
+                aborts.addTask { await server.hardAbort() }
+            }
+        }
+        let elapsed = start.duration(to: clock.now)
+
+        #expect(elapsed < .milliseconds(500))
+        #expect(connection.ownedTransportCount == 0)
+        #expect(await server.trackedIdleConnectionCount == 0)
+        #expect(await server.trackedIdleTaskCount == 0)
+        #expect(!channel.isActive)
+        _ = await gracefulClose.result
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func hardAbortInterruptsConcurrentServerDisconnectWaitingForDone() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+
+        var continuationReference: AsyncStream<IMAPServerEvent>.Continuation?
+        let stream = AsyncStream<IMAPServerEvent> { continuation in
+            continuationReference = continuation
+        }
+        let continuation = try #require(continuationReference)
+        try await connection.startIdleSession(continuation: continuation)
+        let cycleTask = Task<Void, Never> {
+            for await _ in stream {}
+        }
+
+        let server = IMAPServer(host: "invalid.invalid", port: 993)
+        let sessionID = UUID()
+        await server.trackIdleConnection(id: sessionID, mailbox: "INBOX", connection: connection)
+        try await server.attachIdleRuntime(
+            id: sessionID,
+            matching: connection,
+            cycleTask: cycleTask,
+            continuation: continuation
+        )
+
+        let gracefulDisconnect = Task {
+            try await server.disconnect()
+        }
+        try await waitUntil {
+            await server.gracefullyClosingIdleConnectionCount == 1
+        }
+
+        await server.hardAbort()
+        _ = await gracefulDisconnect.result
+
+        #expect(connection.ownedTransportCount == 0)
+        #expect(await server.trackedIdleConnectionCount == 0)
+        #expect(await server.trackedIdleTaskCount == 0)
+        #expect(!channel.isActive)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func abortAwaitsLateConnectCandidateClosure() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+        for _ in 0..<16 {
+            let eventLoop = NIOAsyncTestingEventLoop()
+            let channel = NIOAsyncTestingChannel(loop: eventLoop)
+            let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+            try await channel.connect(to: address).get()
+            let transportPromise = group.next().makePromise(of: Channel.self)
+
+            let connection = IMAPConnection(
+                host: "invalid.invalid",
+                port: 993,
+                group: group,
+                loggerLabel: "test.imap.connection",
+                outboundLabel: "test.imap.out",
+                inboundLabel: "test.imap.in",
+                connectOverride: { registerChannel in
+                    group.next().scheduleTask(in: .milliseconds(10)) {
+                        registerChannel(channel)
+                        transportPromise.succeed(channel)
+                    }
+                    return transportPromise.futureResult
+                }
+            )
+
+            let connectTask = Task {
+                try await connection.connect()
+            }
+            try await waitUntil { connection.hasPendingTransportConnect }
+
+            let start = ContinuousClock().now
+            await connection.hardAbort()
+            let elapsed = start.duration(to: ContinuousClock().now)
+
+            #expect(elapsed < .milliseconds(250))
+            #expect(connection.ownedTransportCount == 0)
+            #expect(!connection.hasPendingTransportConnect)
+            #expect(!channel.isActive)
+            _ = await connectTask.result
+            _ = try? await channel.finish(acceptAlreadyClosed: true)
+        }
+
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func idleWriteFailureRestoresPipelineStateAcrossRetries() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = await NIOAsyncTestingChannel(handler: RejectOutboundWritesHandler(), loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+
+        for _ in 0..<16 {
+            var continuationReference: AsyncStream<IMAPServerEvent>.Continuation?
+            let stream = AsyncStream<IMAPServerEvent> { continuation in
+                continuationReference = continuation
+            }
+            let continuation = try #require(continuationReference)
+            let consumer = Task<Void, Never> {
+                for await _ in stream {}
+            }
+
+            do {
+                try await connection.startIdleSession(continuation: continuation)
+                Issue.record("Expected the IDLE command write to fail")
+            } catch is ExpectedWriteFailure {
+                // Expected.
+            } catch {
+                Issue.record("Unexpected IDLE setup error: \(error)")
+            }
+
+            await consumer.value
+            #expect(!connection.hasIdleHandler)
+            #expect(!connection.hasActiveResponseHandler)
+            #expect(await !connection.hasInstalledIdleHandler())
+        }
+
+        await connection.hardAbort()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+}
+
+private struct ExpectedWriteFailure: Error {}
+
+private final class RejectOutboundWritesHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = IMAPClientHandler.OutboundIn
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        promise?.fail(ExpectedWriteFailure())
+    }
+}
+
+private func makeConnection(group: EventLoopGroup) -> IMAPConnection {
+    IMAPConnection(
+        host: "invalid.invalid",
+        port: 993,
+        group: group,
+        loggerLabel: "test.imap.connection",
+        outboundLabel: "test.imap.out",
+        inboundLabel: "test.imap.in"
+    )
 }
 
 private actor AsyncGate {
