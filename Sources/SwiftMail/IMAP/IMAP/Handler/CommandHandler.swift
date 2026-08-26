@@ -61,6 +61,11 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
         self.promise = promise
     }
 
+    /// Concrete witness so specialized handlers can bind resources when added.
+    /// A protocol-extension default selected by the base conformance would not
+    /// dynamically dispatch a same-named method declared only by a subclass.
+    func handlerAdded(context: ChannelHandlerContext) {}
+
     /// Concrete witness so specialized handlers can reliably observe removal.
     /// A protocol-extension default selected by the base conformance would not
     /// dynamically dispatch a same-named method declared only by a subclass.

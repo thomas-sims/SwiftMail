@@ -479,6 +479,196 @@ struct XOAUTH2SecurityTests {
         #expect(!capture.joinedMessages.contains("continuation-write-error-sentinel"))
         #expect(!errorSurfaces(error).contains("continuation-write-error-sentinel"))
     }
+
+    @Test
+    func lateStatusBufferAndDrainedEventsNeverExposeServerText() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.response-buffer", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let responseBuffer = UntaggedResponseBuffer(logger: logger)
+        let channel = EmbeddedChannel()
+        try await channel.pipeline.addHandlers([imapLogger, responseBuffer])
+
+        let authCommand = TaggedCommand(
+            tag: "A950",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(authCommand)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+
+        try channel.writeInbound(Response.tagged(TaggedResponse(
+            tag: "A950",
+            state: .no(ResponseText(text: "completed-auth-buffer-sentinel"))
+        )))
+        _ = try channel.readInbound(as: Response.self)
+        #expect(!imapLogger.isAuthenticationRedactionActive)
+
+        // Release broad terminal quarantine exactly as a subsequent real
+        // command does. Status text still has its unconditional privacy rule.
+        let ordinaryCommand = TaggedCommand(tag: "N951", command: .noop)
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(ordinaryCommand)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+        #expect(!imapLogger.isAuthenticationTerminalQuarantineActive)
+        responseBuffer.hasActiveHandler = false
+
+        let markers = [
+            "late-conditional-text-sentinel",
+            "late-conditional-code-sentinel",
+            "late-alert-sentinel",
+            "late-bye-sentinel",
+            "late-fatal-sentinel",
+        ]
+        let lateResponses: [Response] = [
+            .untagged(.conditionalState(.no(ResponseText(
+                code: .other(markers[1], markers[0]),
+                text: markers[0]
+            )))),
+            .untagged(.conditionalState(.ok(ResponseText(code: .alert, text: markers[2])))),
+            .untagged(.conditionalState(.bye(ResponseText(text: markers[3])))),
+            .fatal(ResponseText(code: .other(markers[4], nil), text: markers[4])),
+        ]
+
+        for response in lateResponses {
+            try channel.writeInbound(response)
+            let forwarded = try channel.readInbound(as: Response.self)
+            #expect(forwarded != nil)
+            if let forwarded {
+                for marker in markers {
+                    #expect(!String(describing: forwarded).contains(marker))
+                }
+            }
+        }
+
+        let stored = responseBuffer.drainBuffer()
+        #expect(stored.count == lateResponses.count)
+        for marker in markers {
+            #expect(!String(describing: stored).contains(marker))
+        }
+
+        // Re-enter through the production pipeline and exercise the exact
+        // production drain/event bridge used by IMAPConnection.
+        for response in lateResponses {
+            try channel.writeInbound(response)
+            _ = try channel.readInbound(as: Response.self)
+        }
+        let events = responseBuffer.drainServerEvents(logger: logger)
+
+        var alertTexts: [String] = []
+        var byeTexts: [String] = []
+        for event in events {
+            switch event {
+            case .alert(let text):
+                alertTexts.append(text)
+            case .bye(let text):
+                if let text { byeTexts.append(text) }
+            default:
+                break
+            }
+        }
+        #expect(alertTexts == ["Server status details unavailable."])
+        #expect(byeTexts == [
+            "Server closed the connection.",
+            "Server closed the connection.",
+        ])
+
+        imapLogger.flushInboundBuffer()
+        let allSurfaces = capture.joinedMessages
+            + String(describing: stored)
+            + String(describing: alertTexts)
+            + String(describing: byeTexts)
+        #expect(allSurfaces.contains("IMAP BYE <redacted>"))
+        #expect(allSurfaces.contains("Buffered response with no active handler: fatal"))
+        for marker in markers + ["completed-auth-buffer-sentinel"] {
+            #expect(!allSurfaces.contains(marker))
+        }
+
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func authenticationTagsAreBoundedToCurrentTransportGeneration() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.transport-generation", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+
+        let oldChannel = EmbeddedChannel(handler: imapLogger)
+        let oldPromise = oldChannel.eventLoop.makePromise(of: [Capability].self)
+        let oldHandler = XOAUTH2AuthenticationHandler(
+            commandTag: "AOLD",
+            promise: oldPromise,
+            credentials: makeCredentialBuffer(using: oldChannel.allocator),
+            expectsChallenge: false,
+            logger: logger,
+            authenticationLogger: imapLogger
+        )
+        try await oldChannel.pipeline.addHandler(oldHandler)
+        try await oldChannel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(
+            makeAuthenticationCommand(tag: "AOLD", using: oldChannel.allocator)
+        )))
+        _ = try oldChannel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+        #expect(imapLogger.authenticationSensitiveTagCount == 1)
+
+        // Rebinding the intentionally shared logger creates a new generation
+        // and atomically discards all old transport authentication state.
+        let currentChannel = EmbeddedChannel(handler: imapLogger)
+        try await currentChannel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(
+            makeAuthenticationCommand(tag: "ANEW", using: currentChannel.allocator)
+        )))
+        _ = try currentChannel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+        #expect(imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.authenticationSensitiveTagCount == 1)
+
+        // A delayed terminal callback and inactive/removal callbacks from the
+        // old pipeline must not add tags or clear the new generation.
+        oldHandler.failAuthentication()
+        #expect(imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.authenticationSensitiveTagCount == 1)
+        try await oldChannel.close().get()
+        _ = try? oldChannel.finish(acceptAlreadyClosed: true)
+        #expect(imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.authenticationSensitiveTagCount == 1)
+
+        try currentChannel.writeInbound(Response.tagged(TaggedResponse(
+            tag: "ANEW",
+            state: .no(ResponseText(text: "current-generation-terminal-sentinel"))
+        )))
+        _ = try currentChannel.readInbound(as: Response.self)
+        #expect(!imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.authenticationSensitiveTagCount == 1)
+        try await currentChannel.close().get()
+        _ = try? currentChannel.finish(acceptAlreadyClosed: true)
+        #expect(imapLogger.authenticationSensitiveTagCount == 0)
+
+        // Repeated reconnect/auth cycles remain bounded to exactly one tag
+        // while live and return to zero at transport retirement.
+        for index in 0..<32 {
+            let channel = EmbeddedChannel(handler: imapLogger)
+            let tag = "R\(index)"
+            try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(
+                makeAuthenticationCommand(tag: tag, using: channel.allocator)
+            )))
+            _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+            #expect(imapLogger.authenticationSensitiveTagCount == 1)
+
+            try channel.writeInbound(Response.tagged(TaggedResponse(
+                tag: tag,
+                state: .no(ResponseText(text: "reconnect-auth-terminal-sentinel"))
+            )))
+            _ = try channel.readInbound(as: Response.self)
+            #expect(imapLogger.authenticationSensitiveTagCount == 1)
+
+            try await channel.close().get()
+            _ = try? channel.finish(acceptAlreadyClosed: true)
+            #expect(imapLogger.authenticationSensitiveTagCount == 0)
+        }
+
+        imapLogger.flushInboundBuffer()
+        #expect(!capture.joinedMessages.contains("current-generation-terminal-sentinel"))
+        #expect(!capture.joinedMessages.contains("reconnect-auth-terminal-sentinel"))
+    }
 }
 
 private enum AuthenticationChallengeFixture {
@@ -637,6 +827,16 @@ private func makeCredentialBuffer(using allocator: ByteBufferAllocator) -> ByteB
     buffer.writeInteger(UInt8(0x01))
     buffer.writeInteger(UInt8(0x01))
     return buffer
+}
+
+private func makeAuthenticationCommand(tag: String, using allocator: ByteBufferAllocator) -> TaggedCommand {
+    TaggedCommand(
+        tag: tag,
+        command: .authenticate(
+            mechanism: AuthenticationMechanism("XOAUTH2"),
+            initialResponse: InitialResponse(makeCredentialBuffer(using: allocator))
+        )
+    )
 }
 
 private func credentialWireBase64() -> String {

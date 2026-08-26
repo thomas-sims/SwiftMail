@@ -431,68 +431,7 @@ final class IMAPConnection {
     /// Returns them converted to `IMAPServerEvent`s. Responses that don't map
     /// to a known event type are logged and skipped.
     func drainBufferedEvents() -> [IMAPServerEvent] {
-        let raw = responseBuffer.drainBuffer()
-        guard !raw.isEmpty else { return [] }
-
-        logger.debug("Draining \(raw.count) buffered response(s)")
-        var events: [IMAPServerEvent] = []
-
-        for response in raw {
-            switch response {
-            case .untagged(let payload):
-                switch payload {
-                case .mailboxData(let data):
-                    switch data {
-                    case .exists(let count):
-                        events.append(.exists(Int(count)))
-                    case .recent(let count):
-                        events.append(.recent(Int(count)))
-                    case .flags(let flags):
-                        events.append(.flags(flags.map { Flag(nio: $0) }))
-                    default:
-                        logger.debug("Buffered unhandled mailboxData: \(data)")
-                    }
-                case .messageData(let data):
-                    switch data {
-                    case .expunge(let seq):
-                        events.append(.expunge(SequenceNumber(seq.rawValue)))
-                    default:
-                        logger.debug("Buffered unhandled messageData: \(data)")
-                    }
-                case .conditionalState(let status):
-                    switch status {
-                    case .ok(let text):
-                        if text.code == .alert {
-                            events.append(.alert(text.text))
-                        }
-                    case .bye(let text):
-                        events.append(.bye(text.text))
-                    default:
-                        break
-                    }
-                case .capabilityData(let caps):
-                    events.append(.capability(caps.map { String($0) }))
-                default:
-                    logger.debug("Buffered unhandled payload: \(payload)")
-                }
-            case .fetch(let fetch):
-                // Collect fetch attributes from buffered fetch sequence
-                switch fetch {
-                case .start, .startUID, .simpleAttribute, .finish:
-                    // Individual fetch parts can't be meaningfully reconstructed here
-                    // since we may not have the complete sequence. Log it.
-                    logger.debug("Buffered fetch response part: \(fetch)")
-                default:
-                    logger.debug("Buffered unhandled fetch: \(fetch)")
-                }
-            case .fatal(let text):
-                events.append(.bye(text.text))
-            default:
-                break
-            }
-        }
-
-        return events
+        responseBuffer.drainServerEvents(logger: logger)
     }
 
     func disconnect() async throws {

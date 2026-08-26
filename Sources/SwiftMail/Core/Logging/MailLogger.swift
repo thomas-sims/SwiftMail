@@ -33,6 +33,12 @@ class MailLogger: ChannelDuplexHandler, @unchecked Sendable {
         self.outboundLogger = outboundLogger
         self.inboundLogger = inboundLogger
     }
+
+    /// Concrete lifecycle witnesses let protocol logger subclasses bind state
+    /// to the pipeline transport that actually owns each callback.
+    func handlerAdded(context: ChannelHandlerContext) {}
+
+    func handlerRemoved(context: ChannelHandlerContext) {}
     
     /// Add a response to the inbound buffer
 	func bufferInboundResponse(_ message: String) {
@@ -99,4 +105,4 @@ class MailLogger: ChannelDuplexHandler, @unchecked Sendable {
     func channelInactive(context: ChannelHandlerContext) {
         context.fireChannelInactive()
     }
-} 
+}

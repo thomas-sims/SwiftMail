@@ -11,6 +11,7 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     private var credentials: ByteBuffer
     private var _observedConnectionTermination = false
     private var _requiresTransportClose = false
+    private var authenticationTransport: IMAPAuthenticationTransport?
     private let authenticationLogger: (any IMAPAuthenticationLogging)?
 
     var observedConnectionTermination: Bool {
@@ -39,6 +40,11 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
 
     override init(commandTag: String, promise: EventLoopPromise<[Capability]>) {
         fatalError("Use init(commandTag:promise:credentials:expectsChallenge:logger:) instead")
+    }
+
+    override func handlerAdded(context: ChannelHandlerContext) {
+        let transport = authenticationLogger?.authenticationTransport(for: context.channel)
+        lock.withLock { authenticationTransport = transport }
     }
 
     override func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -185,6 +191,7 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
 
     private func finishAuthenticationLogging() {
         guard let commandTag else { return }
-        authenticationLogger?.authenticationDidTerminate(tag: commandTag)
+        let transport = lock.withLock { authenticationTransport }
+        authenticationLogger?.authenticationDidTerminate(tag: commandTag, transport: transport)
     }
 }

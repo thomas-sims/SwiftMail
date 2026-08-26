@@ -9,10 +9,19 @@ import NIOConcurrencyHelpers
 @preconcurrency import NIOIMAP
 import NIOIMAPCore
 
+struct IMAPAuthenticationTransport: Equatable, Sendable {
+    fileprivate let generation: UInt64
+}
+
 protocol IMAPAuthenticationLogging: AnyObject, Sendable {
+    /// Returns the current generation only when `channel` is the transport to
+    /// which this logger is presently bound.
+    func authenticationTransport(for channel: Channel) -> IMAPAuthenticationTransport?
+
     /// Ends active authentication logging without making late authentication
-    /// frames eligible for raw rendering.
-    func authenticationDidTerminate(tag: String)
+    /// frames eligible for raw rendering. Stale callbacks from a retired
+    /// transport are ignored rather than mutating a newer connection.
+    func authenticationDidTerminate(tag: String, transport: IMAPAuthenticationTransport?)
 }
 
 /// A channel handler that logs both outgoing and incoming IMAP messages
@@ -21,6 +30,8 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
 	typealias InboundOut = Response
 
     private struct AuthenticationState {
+        var transport: IMAPAuthenticationTransport?
+        var channelID: ObjectIdentifier?
         var activeTag: String?
         /// Redact every inbound frame between authentication termination and
         /// the next structurally observed client command. This covers late
@@ -32,6 +43,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
     }
 
     private var authenticationState = AuthenticationState()
+    private var nextTransportGeneration: UInt64 = 0
 
     var isAuthenticationRedactionActive: Bool {
         lock.withLock { authenticationState.activeTag != nil }
@@ -41,13 +53,43 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
         lock.withLock { authenticationState.isTerminalQuarantineActive }
     }
 
-    func authenticationDidTerminate(tag: String) {
+    /// Test-visible resource invariant: sensitive tags are bounded to one live
+    /// transport and must be empty once that transport is retired.
+    var authenticationSensitiveTagCount: Int {
+        lock.withLock { authenticationState.sensitiveTags.count }
+    }
+
+    func authenticationTransport(for channel: Channel) -> IMAPAuthenticationTransport? {
+        let channelID = ObjectIdentifier(channel)
+        return lock.withLock {
+            guard authenticationState.channelID == channelID else { return nil }
+            return authenticationState.transport
+        }
+    }
+
+    func authenticationDidTerminate(tag: String, transport: IMAPAuthenticationTransport?) {
         lock.withLock {
+            guard let transport, authenticationState.transport == transport else { return }
             authenticationState.sensitiveTags.insert(tag)
             guard authenticationState.activeTag == tag else { return }
             authenticationState.activeTag = nil
             authenticationState.isTerminalQuarantineActive = true
         }
+    }
+
+    override func handlerAdded(context: ChannelHandlerContext) {
+        let channelID = ObjectIdentifier(context.channel)
+        lock.withLock {
+            nextTransportGeneration &+= 1
+            authenticationState = AuthenticationState(
+                transport: IMAPAuthenticationTransport(generation: nextTransportGeneration),
+                channelID: channelID
+            )
+        }
+    }
+
+    override func handlerRemoved(context: ChannelHandlerContext) {
+        resetAuthenticationStateIfCurrent(channel: context.channel)
     }
     
     // Regular expressions for redacting sensitive information
@@ -64,6 +106,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
             case .tagged(let taggedCommand):
                 if case .authenticate = taggedCommand.command {
                     lock.withLock {
+                        guard authenticationState.channelID == ObjectIdentifier(context.channel) else { return }
                         authenticationState.activeTag = taggedCommand.tag
                         authenticationState.isTerminalQuarantineActive = false
                         authenticationState.sensitiveTags.insert(taggedCommand.tag)
@@ -72,7 +115,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
                     context.write(data, promise: promise)
                     return
                 }
-                beginOrdinaryCommand()
+                beginOrdinaryCommand(on: context.channel)
             case .continuationResponse:
                 // This frame carries authentication bytes by definition. Redact
                 // it even if an earlier handler/state transition failed to
@@ -82,7 +125,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
                 return
             case .append:
                 if part.tag != nil {
-                    beginOrdinaryCommand()
+                    beginOrdinaryCommand(on: context.channel)
                 }
             case .idleDone:
                 break
@@ -113,7 +156,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
 	override func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let response = unwrapInboundIn(data) as! Response
 
-        switch authenticationLoggingDisposition(for: response) {
+        switch authenticationLoggingDisposition(for: response, channel: context.channel) {
         case .challenge:
             // Authentication challenges are arbitrary server-provided bytes.
             // Never stringify or retain them in the logging buffer.
@@ -142,10 +185,7 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
     }
 
     override func channelInactive(context: ChannelHandlerContext) {
-        lock.withLock {
-            authenticationState.activeTag = nil
-            authenticationState.isTerminalQuarantineActive = false
-        }
+        resetAuthenticationStateIfCurrent(channel: context.channel)
         context.fireChannelInactive()
     }
 
@@ -157,14 +197,19 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
         case ordinary
     }
 
-    private func beginOrdinaryCommand() {
+    private func beginOrdinaryCommand(on channel: Channel) {
+        let channelID = ObjectIdentifier(channel)
         lock.withLock {
+            guard authenticationState.channelID == channelID else { return }
             guard authenticationState.activeTag == nil else { return }
             authenticationState.isTerminalQuarantineActive = false
         }
     }
 
-    private func authenticationLoggingDisposition(for response: Response) -> AuthenticationLoggingDisposition {
+    private func authenticationLoggingDisposition(
+        for response: Response,
+        channel: Channel
+    ) -> AuthenticationLoggingDisposition {
         if case .authenticationChallenge = response {
             return .challenge
         }
@@ -183,7 +228,14 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
             }
         }
 
+        let channelID = ObjectIdentifier(channel)
         return lock.withLock {
+            // A late read from an older pipeline must never render data after
+            // this logger has been rebound to another transport generation.
+            guard authenticationState.channelID == channelID else {
+                return .authenticationFrame
+            }
+
             if case .tagged(let taggedResponse) = response {
                 if authenticationState.sensitiveTags.contains(taggedResponse.tag) {
                     if authenticationState.activeTag == taggedResponse.tag {
@@ -203,6 +255,14 @@ final class IMAPLogger: MailLogger, IMAPAuthenticationLogging, @unchecked Sendab
                 return .authenticationFrame
             }
             return .ordinary
+        }
+    }
+
+    private func resetAuthenticationStateIfCurrent(channel: Channel) {
+        let channelID = ObjectIdentifier(channel)
+        lock.withLock {
+            guard authenticationState.channelID == channelID else { return }
+            authenticationState = AuthenticationState()
         }
     }
 }
