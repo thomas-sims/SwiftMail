@@ -60,6 +60,11 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
         self.commandTag = commandTag
         self.promise = promise
     }
+
+    /// Concrete witness so specialized handlers can reliably observe removal.
+    /// A protocol-extension default selected by the base conformance would not
+    /// dynamically dispatch a same-named method declared only by a subclass.
+    func handlerRemoved(context: ChannelHandlerContext) {}
     
     /// Handle the completion of this command
     /// - Parameter context: The channel handler context

@@ -150,6 +150,335 @@ struct XOAUTH2SecurityTests {
 
         _ = try? channel.finish()
     }
+
+    @Test
+    func terminalQuarantineRedactsLateAuthenticationFramesAndReleasesForOrdinaryCommands() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.terminal-quarantine", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let channel = EmbeddedChannel(handler: imapLogger)
+
+        let authCommand = TaggedCommand(
+            tag: "A900",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(authCommand)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+
+        let expected = Response.tagged(TaggedResponse(
+            tag: "A900",
+            state: .no(ResponseText(text: "terminal-auth-sentinel"))
+        ))
+        try channel.writeInbound(expected)
+        _ = try channel.readInbound(as: Response.self)
+        #expect(!imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.isAuthenticationTerminalQuarantineActive)
+
+        for sentinel in ["duplicate-auth-sentinel-one", "duplicate-auth-sentinel-two"] {
+            let duplicate = Response.tagged(TaggedResponse(
+                tag: "A900",
+                state: .bad(ResponseText(text: sentinel))
+            ))
+            try channel.writeInbound(duplicate)
+            _ = try channel.readInbound(as: Response.self)
+        }
+
+        let ordinaryCommand = TaggedCommand(tag: "N901", command: .noop)
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(ordinaryCommand)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+        #expect(!imapLogger.isAuthenticationTerminalQuarantineActive)
+
+        let ordinary = Response.tagged(TaggedResponse(
+            tag: "N901",
+            state: .no(ResponseText(text: "ordinary-after-auth-sentinel"))
+        ))
+        try channel.writeInbound(ordinary)
+        _ = try channel.readInbound(as: Response.self)
+
+        let arbitrarilyLate = Response.tagged(TaggedResponse(
+            tag: "A900",
+            state: .bad(ResponseText(text: "late-auth-after-next-command-sentinel"))
+        ))
+        try channel.writeInbound(arbitrarilyLate)
+        _ = try channel.readInbound(as: Response.self)
+
+        let lateBye = Response.untagged(.conditionalState(
+            .bye(ResponseText(text: "late-bye-after-next-command-sentinel"))
+        ))
+        try channel.writeInbound(lateBye)
+        _ = try channel.readInbound(as: Response.self)
+
+        imapLogger.flushInboundBuffer()
+        let logs = capture.joinedMessages
+        #expect(logs.contains("ordinary-after-auth-sentinel"))
+        #expect(logs.contains("IMAP BYE <redacted>"))
+        for forbidden in [
+            "terminal-auth-sentinel",
+            "duplicate-auth-sentinel-one",
+            "duplicate-auth-sentinel-two",
+            "late-auth-after-next-command-sentinel",
+            "late-bye-after-next-command-sentinel",
+        ] {
+            #expect(!logs.contains(forbidden))
+        }
+
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func authTimeStatusAndFatalTextAreSuppressedFromHandlerAndEveryErrorSurface() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.auth-status", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: [Capability].self)
+        let handler = XOAUTH2AuthenticationHandler(
+            commandTag: "A777",
+            promise: promise,
+            credentials: makeCredentialBuffer(using: channel.allocator),
+            expectsChallenge: false,
+            logger: logger,
+            authenticationLogger: imapLogger
+        )
+        try await channel.pipeline.addHandlers([imapLogger, handler])
+
+        let command = TaggedCommand(
+            tag: "A777",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+
+        let warning = Response.untagged(.conditionalState(
+            .no(ResponseText(text: "auth-time-status-sentinel"))
+        ))
+        try channel.writeInbound(warning)
+        _ = try channel.readInbound(as: Response.self)
+
+        let bye = Response.untagged(.conditionalState(
+            .bye(ResponseText(text: "auth-time-bye-sentinel"))
+        ))
+        try channel.writeInbound(bye)
+        _ = try channel.readInbound(as: Response.self)
+
+        let error = await fixedXOAUTH2Failure(from: promise.futureResult)
+        imapLogger.flushInboundBuffer()
+        let surfaces = errorSurfaces(error)
+        for forbidden in ["auth-time-status-sentinel", "auth-time-bye-sentinel"] {
+            #expect(!capture.joinedMessages.contains(forbidden))
+            #expect(!surfaces.contains(forbidden))
+        }
+        #expect(capture.joinedMessages.contains("IMAP NO <redacted>"))
+        #expect(capture.joinedMessages.contains("IMAP BYE <redacted>"))
+        #expect(handler.untaggedResponses.isEmpty)
+        #expect(handler.observedConnectionTermination)
+        #expect(!imapLogger.isAuthenticationRedactionActive)
+        #expect(imapLogger.isAuthenticationTerminalQuarantineActive)
+
+        // A subsequent structurally typed command ends broad quarantine, while
+        // status/BYE text remains unconditionally non-renderable.
+        let next = TaggedCommand(tag: "N902", command: .noop)
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(next)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+        #expect(!imapLogger.isAuthenticationTerminalQuarantineActive)
+
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func authTimeFatalTextIsSuppressedAndConvertedToFixedFailure() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.auth-fatal", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: [Capability].self)
+        let handler = XOAUTH2AuthenticationHandler(
+            commandTag: "A779",
+            promise: promise,
+            credentials: makeCredentialBuffer(using: channel.allocator),
+            expectsChallenge: false,
+            logger: logger,
+            authenticationLogger: imapLogger
+        )
+        try await channel.pipeline.addHandlers([imapLogger, handler])
+
+        let command = TaggedCommand(
+            tag: "A779",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+        _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+
+        let sentinel = "auth-time-fatal-sentinel"
+        try channel.writeInbound(Response.fatal(ResponseText(text: sentinel)))
+        _ = try channel.readInbound(as: Response.self)
+
+        let error = await fixedXOAUTH2Failure(from: promise.futureResult)
+        imapLogger.flushInboundBuffer()
+        #expect(capture.joinedMessages.contains("IMAP FATAL <redacted>"))
+        #expect(!capture.joinedMessages.contains(sentinel))
+        #expect(!errorSurfaces(error).contains(sentinel))
+        #expect(handler.untaggedResponses.isEmpty)
+        #expect(handler.observedConnectionTermination)
+        #expect(!imapLogger.isAuthenticationRedactionActive)
+
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func malformedParserBufferFailsOpaquelyAndClosesTransport() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.parser-error", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: [Capability].self)
+        let handler = XOAUTH2AuthenticationHandler(
+            commandTag: "A777",
+            promise: promise,
+            credentials: makeCredentialBuffer(using: channel.allocator),
+            expectsChallenge: false,
+            logger: logger,
+            authenticationLogger: imapLogger
+        )
+        try await channel.pipeline.addHandlers([IMAPClientHandler(), imapLogger, handler])
+
+        let command = TaggedCommand(
+            tag: "A777",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+        _ = try channel.readOutbound(as: ByteBuffer.self)
+
+        let sentinel = "malformed-parser-buffer-sentinel"
+        var malformed = channel.allocator.buffer(capacity: sentinel.utf8.count + 4)
+        // OOPS is not a tagged response state. This complete line makes pinned
+        // NIOIMAP wrap the original wire buffer in IMAPDecoderError.
+        malformed.writeString("A777 OOPS \(sentinel)\r\n")
+        try channel.writeInbound(malformed)
+
+        guard handler.isCompleted else {
+            Issue.record("Expected malformed response to fail the auth handler")
+            try await channel.close().get()
+            _ = try? channel.finish(acceptAlreadyClosed: true)
+            return
+        }
+
+        let error = await fixedXOAUTH2Failure(from: promise.futureResult)
+        #expect(!channel.isActive)
+        _ = try? channel.finish(acceptAlreadyClosed: true)
+        #expect(await boundedFutureResult(channel.closeFuture) != nil)
+        imapLogger.flushInboundBuffer()
+        #expect(handler.requiresTransportClose)
+        #expect(!capture.joinedMessages.contains(sentinel))
+        #expect(!errorSurfaces(error).contains(sentinel))
+    }
+
+    @Test
+    func pipelineErrorAndHandlerRemovalBothFailOpaquelyAndRetireTransport() async throws {
+        for (tag, removeHandler) in [("A810", false), ("A811", true)] {
+            let capture = LogCapture()
+            let logger = makeCaptureLogger(label: "test.imap.security.terminal-path", capture: capture)
+            let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+            let channel = EmbeddedChannel()
+            let promise = channel.eventLoop.makePromise(of: [Capability].self)
+            let handler = XOAUTH2AuthenticationHandler(
+                commandTag: tag,
+                promise: promise,
+                credentials: makeCredentialBuffer(using: channel.allocator),
+                expectsChallenge: false,
+                logger: logger,
+                authenticationLogger: imapLogger
+            )
+            try await channel.pipeline.addHandlers([imapLogger, handler])
+
+            let command = TaggedCommand(
+                tag: tag,
+                command: .authenticate(
+                    mechanism: AuthenticationMechanism("XOAUTH2"),
+                    initialResponse: InitialResponse(makeCredentialBuffer(using: channel.allocator))
+                )
+            )
+            try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+            _ = try channel.readOutbound(as: IMAPClientHandler.OutboundIn.self)
+
+            let sentinel = "terminal-path-wire-sentinel-\(tag)"
+            if removeHandler {
+                try await channel.pipeline.removeHandler(handler).get()
+            } else {
+                channel.pipeline.fireErrorCaught(SensitivePipelineError(sentinel: sentinel))
+            }
+
+            let error = await fixedXOAUTH2Failure(from: promise.futureResult)
+            #expect(!channel.isActive)
+            _ = try? channel.finish(acceptAlreadyClosed: true)
+            #expect(await boundedFutureResult(channel.closeFuture) != nil)
+            imapLogger.flushInboundBuffer()
+            #expect(handler.requiresTransportClose)
+            #expect(!imapLogger.isAuthenticationRedactionActive)
+            #expect(!imapLogger.isAuthenticationTerminalQuarantineActive)
+            #expect(!capture.joinedMessages.contains(sentinel))
+            #expect(!errorSurfaces(error).contains(sentinel))
+        }
+    }
+
+    @Test
+    func continuationWriteFailurePublishesFixedFailureAndClosesTransport() async throws {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.security.continuation-write", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        let failer = SecondByteBufferWriteFailer(
+            error: SensitivePipelineError(sentinel: "continuation-write-error-sentinel")
+        )
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: [Capability].self)
+        let handler = XOAUTH2AuthenticationHandler(
+            commandTag: "A812",
+            promise: promise,
+            credentials: makeCredentialBuffer(using: channel.allocator),
+            expectsChallenge: true,
+            logger: logger,
+            authenticationLogger: imapLogger
+        )
+        try await channel.pipeline.addHandlers([failer, IMAPClientHandler(), imapLogger, handler])
+
+        let command = TaggedCommand(
+            tag: "A812",
+            command: .authenticate(
+                mechanism: AuthenticationMechanism("XOAUTH2"),
+                initialResponse: nil
+            )
+        )
+        try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.tagged(command)))
+        _ = try channel.readOutbound(as: ByteBuffer.self)
+
+        var challenge = channel.allocator.buffer(capacity: 4)
+        challenge.writeString("+ \r\n")
+        try channel.writeInbound(challenge)
+
+        let error = await fixedXOAUTH2Failure(from: promise.futureResult)
+        #expect(!channel.isActive)
+        _ = try? channel.finish(acceptAlreadyClosed: true)
+        #expect(await boundedFutureResult(channel.closeFuture) != nil)
+        imapLogger.flushInboundBuffer()
+        #expect(failer.writeCount == 2)
+        #expect(failer.failedWriteCount == 1)
+        #expect(handler.requiresTransportClose)
+        #expect(capture.joinedMessages.contains("AUTHENTICATE continuation <redacted>"))
+        #expect(!capture.joinedMessages.contains("continuation-write-error-sentinel"))
+        #expect(!errorSurfaces(error).contains("continuation-write-error-sentinel"))
+    }
 }
 
 private enum AuthenticationChallengeFixture {
@@ -200,7 +529,8 @@ private func verifyFailureIsRedacted(
         promise: promise,
         credentials: credentials,
         expectsChallenge: expectsChallenge,
-        logger: logger
+        logger: logger,
+        authenticationLogger: imapLogger
     )
     try await channel.pipeline.addHandler(handler)
 
@@ -312,6 +642,107 @@ private func makeCredentialBuffer(using allocator: ByteBufferAllocator) -> ByteB
 private func credentialWireBase64() -> String {
     let raw = "user=fixture-user\u{01}auth=Bearer fixture-credential-wire-sentinel\u{01}\u{01}"
     return Data(raw.utf8).base64EncodedString()
+}
+
+private func fixedXOAUTH2Failure(
+    from future: EventLoopFuture<[Capability]>
+) async -> IMAPError {
+    guard let result = await boundedFutureResult(future) else {
+        Issue.record("Timed out waiting for fixed XOAUTH2 authentication failure")
+        return .xoauth2AuthenticationFailed
+    }
+
+    do {
+        _ = try result.get()
+        Issue.record("Expected fixed XOAUTH2 authentication failure")
+    } catch let error as IMAPError {
+        if case .authFailed(let reason) = error {
+            #expect(reason == IMAPError.xoauth2AuthenticationFailureReason)
+        } else {
+            Issue.record("Expected authFailed category")
+        }
+        return error
+    } catch {
+        Issue.record("Unexpected XOAUTH2 error type")
+    }
+    return .xoauth2AuthenticationFailed
+}
+
+private func boundedFutureResult<Value: Sendable>(
+    _ future: EventLoopFuture<Value>,
+    timeoutNanoseconds: UInt64 = 2_000_000_000
+) async -> Result<Value, Error>? {
+    await withCheckedContinuation { continuation in
+        let box = BoundedResultBox<Value>(continuation: continuation)
+        future.whenComplete { result in
+            box.complete(result)
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+            box.complete(nil)
+        }
+    }
+}
+
+private final class BoundedResultBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Result<Value, Error>?, Never>?
+
+    init(continuation: CheckedContinuation<Result<Value, Error>?, Never>) {
+        self.continuation = continuation
+    }
+
+    func complete(_ result: Result<Value, Error>?) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Result<Value, Error>?, Never>? in
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: result)
+    }
+}
+
+private func errorSurfaces(_ error: Error) -> String {
+    let nsError = error as NSError
+    return [
+        String(describing: error),
+        String(reflecting: error),
+        error.localizedDescription,
+        nsError.localizedDescription,
+        nsError.localizedFailureReason ?? "",
+        String(describing: nsError),
+        String(reflecting: nsError),
+    ].joined(separator: " ")
+}
+
+private struct SensitivePipelineError: Error, LocalizedError, CustomStringConvertible, Sendable {
+    let sentinel: String
+
+    var description: String { sentinel }
+    var errorDescription: String? { sentinel }
+    var failureReason: String? { sentinel }
+}
+
+private final class SecondByteBufferWriteFailer: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private let error: SensitivePipelineError
+    private(set) var writeCount = 0
+    private(set) var failedWriteCount = 0
+
+    init(error: SensitivePipelineError) {
+        self.error = error
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        writeCount += 1
+        if writeCount == 2 {
+            failedWriteCount += 1
+            promise?.fail(error)
+            return
+        }
+        context.write(data, promise: promise)
+    }
 }
 
 private final class LogCapture: @unchecked Sendable {

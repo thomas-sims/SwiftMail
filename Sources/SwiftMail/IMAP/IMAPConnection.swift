@@ -698,10 +698,22 @@ final class IMAPConnection {
             promise: handlerPromise,
             credentials: credentialBuffer,
             expectsChallenge: expectsChallenge,
-            logger: logger
+            logger: logger,
+            authenticationLogger: duplexLogger
         )
 
-        try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
+        do {
+            try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
+        } catch {
+            // A pipeline setup failure is not allowed to expose its raw error
+            // through the authentication API or leave a possibly corrupt
+            // transport eligible for reuse.
+            handler.failAuthentication(requiresTransportClose: true)
+            channel.close(mode: .all, promise: nil)
+            try? await channel.closeFuture.get()
+            clearInvalidChannel()
+            throw IMAPError.xoauth2AuthenticationFailed
+        }
         responseBuffer.hasActiveHandler = true
 
         let initialResponse = expectsChallenge ? nil : InitialResponse(credentialBuffer)
@@ -713,27 +725,47 @@ final class IMAPConnection {
         let logger = self.logger
         let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(authenticationTimeoutSeconds))) {
             logger.warning("XOAUTH2 authentication timed out after \(authenticationTimeoutSeconds) seconds")
-            handler.failWithError(IMAPError.timeout)
+            handler.failAuthentication(requiresTransportClose: true)
+            channel.close(mode: .all, promise: nil)
         }
 
         do {
-            try await channel.writeAndFlush(wrapped).get()
+            do {
+                try await channel.writeAndFlush(wrapped).get()
+            } catch {
+                // The original write error can carry channel/parser details and
+                // the command outcome is protocol-ambiguous. Publish only the
+                // fixed auth failure and retire the transport.
+                handler.failAuthentication(requiresTransportClose: true)
+                channel.close(mode: .all, promise: nil)
+            }
             let refreshedCapabilities = try await handlerPromise.futureResult.get()
 
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
-            await handleConnectionTerminationInResponses(handler.untaggedResponses)
+            if handler.observedConnectionTermination {
+                try? await disconnect()
+            }
             duplexLogger.flushInboundBuffer()
 
             try await refreshCapabilities(using: refreshedCapabilities)
         } catch {
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
-            await handleConnectionTerminationInResponses(handler.untaggedResponses)
+            if handler.requiresTransportClose {
+                channel.close(mode: .all, promise: nil)
+                try? await channel.closeFuture.get()
+                clearInvalidChannel()
+            } else if handler.observedConnectionTermination {
+                try? await disconnect()
+            }
             duplexLogger.flushInboundBuffer()
 
             try? await channel.pipeline.removeHandler(handler)
 
+            // Handler-owned auth failures are always the fixed category. The
+            // only other reachable error here is post-auth capability refresh,
+            // which occurs after the do-block's handler result has succeeded.
             throw error
         }
     }
