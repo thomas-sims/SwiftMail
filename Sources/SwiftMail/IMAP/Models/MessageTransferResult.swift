@@ -48,7 +48,7 @@ public struct UIDMapping: Hashable, Sendable {
     }
 }
 
-/// The typed outcome of a COPY or native MOVE command that completed with OK.
+/// The typed outcome of a COPY or MOVE workflow that completed with OK.
 public enum MessageTransferResult: Hashable, Sendable {
     /// The server supplied a valid, source-proven COPYUID mapping.
     case completed(UIDMapping)
@@ -76,7 +76,8 @@ public enum MessageTransferResult: Hashable, Sendable {
     }
 }
 
-/// A categorized COPY or MOVE failure with an explicit retry-safety boundary.
+/// A categorized transfer or exact-deletion failure with an explicit
+/// retry-safety boundary.
 ///
 /// This error intentionally does not retain server response text or transport
 /// errors, which may contain private mailbox or authentication data.
@@ -84,12 +85,17 @@ public struct IMAPMutationFailure: Error, Hashable, Sendable {
     public enum Operation: Hashable, Sendable {
         case copy
         case move
+        case uidExpunge
+        case permanentDelete
     }
 
     public enum Phase: Hashable, Sendable {
         case validation
         case dispatch
         case response
+        case fallbackCopy
+        case markDeleted
+        case uidExpunge
     }
 
     public enum Certainty: Hashable, Sendable {
@@ -105,6 +111,7 @@ public struct IMAPMutationFailure: Error, Hashable, Sendable {
         case unsupportedOperation
         case transportFailure
         case timedOut
+        case cancelled
         case serverRejected
         case protocolFailure
     }
@@ -119,6 +126,40 @@ public struct IMAPMutationFailure: Error, Hashable, Sendable {
         self.phase = phase
         self.certainty = certainty
         self.reason = reason
+    }
+}
+
+extension IMAPMutationFailure {
+    static func categorizedReason(for error: Error) -> Reason {
+        if error is CancellationError {
+            return .cancelled
+        }
+        if let commandError = error as? MessageTransferCommandError {
+            switch commandError {
+            case .serverRejected:
+                return .serverRejected
+            case .unsupportedOperation:
+                return .unsupportedOperation
+            }
+        }
+        if let imapError = error as? IMAPError {
+            switch imapError {
+            case .timeout:
+                return .timedOut
+            case .emptyIdentifierSet, .invalidArgument:
+                return .invalidRequest
+            case .commandNotSupported:
+                return .unsupportedOperation
+            case .connectionFailed:
+                return .transportFailure
+            default:
+                return .protocolFailure
+            }
+        }
+        if error is IMAPConnectionError {
+            return .transportFailure
+        }
+        return .protocolFailure
     }
 }
 

@@ -30,23 +30,33 @@ public struct StoreData {
     
     /// The type of store operation
     public let storeType: StoreType
+
+    /// Whether the server should suppress untagged FETCH responses for this STORE.
+    public let silent: Bool
     
     /// Initialize with flags and store type
     /// - Parameters:
     ///   - flags: The flags to store
     ///   - storeType: The type of store operation
-    public init(flags: [Flag], storeType: StoreType) {
+    ///   - silent: Whether to use the `.SILENT` STORE variant. Defaults to `false`.
+    public init(flags: [Flag], storeType: StoreType, silent: Bool = false) {
         self.flags = flags
         self.storeType = storeType
+        self.silent = silent
     }
     
     /// Factory method for creating a StoreData with flags
     /// - Parameters:
     ///   - flags: The flags to store
     ///   - storeType: The type of store operation
+    ///   - silent: Whether to use the `.SILENT` STORE variant. Defaults to `false`.
     /// - Returns: A new StoreData instance
-    public static func flags(_ flags: [Flag], _ storeType: StoreType) -> StoreData {
-        return StoreData(flags: flags, storeType: storeType)
+    public static func flags(
+        _ flags: [Flag],
+        _ storeType: StoreType,
+        silent: Bool = false
+    ) -> StoreData {
+        return StoreData(flags: flags, storeType: storeType, silent: silent)
     }
     
     /// Convert to NIOIMAPCore.StoreData
@@ -59,11 +69,11 @@ public struct StoreData {
         let storeFlags: NIOIMAPCore.StoreFlags
         switch storeType {
         case .add:
-            storeFlags = NIOIMAPCore.StoreFlags.add(silent: false, list: nioFlags)
+            storeFlags = NIOIMAPCore.StoreFlags.add(silent: silent, list: nioFlags)
         case .remove:
-            storeFlags = NIOIMAPCore.StoreFlags.remove(silent: false, list: nioFlags)
+            storeFlags = NIOIMAPCore.StoreFlags.remove(silent: silent, list: nioFlags)
         case .replace:
-            storeFlags = NIOIMAPCore.StoreFlags.replace(silent: false, list: nioFlags)
+            storeFlags = NIOIMAPCore.StoreFlags.replace(silent: silent, list: nioFlags)
         }
         return .flags(storeFlags)
     }

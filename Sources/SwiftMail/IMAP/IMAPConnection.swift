@@ -175,6 +175,7 @@ final class IMAPConnection {
     private let tlsHandlerFactory: TLSHandlerFactory
     private let candidateLoggerFactory: CandidateLoggerFactory
     private let candidateResponseBufferFactory: CandidateResponseBufferFactory
+    private let mutationTimeoutSeconds: Int
     private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
     private let commandQueue = IMAPCommandQueue()
@@ -191,7 +192,8 @@ final class IMAPConnection {
         connectOverride: ConnectOverride? = nil,
         tlsHandlerFactory: TLSHandlerFactory? = nil,
         candidateLoggerFactory: CandidateLoggerFactory? = nil,
-        candidateResponseBufferFactory: CandidateResponseBufferFactory? = nil
+        candidateResponseBufferFactory: CandidateResponseBufferFactory? = nil,
+        mutationTimeoutSeconds: Int = 5
     ) {
         self.host = host
         self.port = port
@@ -209,6 +211,7 @@ final class IMAPConnection {
         self.candidateResponseBufferFactory = candidateResponseBufferFactory ?? { _ in
             UntaggedResponseBuffer()
         }
+        self.mutationTimeoutSeconds = mutationTimeoutSeconds
 
         self.logger = Logging.Logger(label: loggerLabel)
     }
@@ -1075,6 +1078,217 @@ final class IMAPConnection {
         }
     }
 
+    /// Executes native MOVE or its UIDPLUS-only fallback while holding one
+    /// non-reentrant command-queue lease for the entire mutation.
+    func executeMoveWithFallback<T: MessageIdentifier>(
+        messages identifierSet: MessageIdentifierSet<T>,
+        to destinationMailbox: String
+    ) async throws -> MessageTransferCommandResponse {
+        let moveCommand = MoveCommand(
+            identifierSet: identifierSet,
+            destinationMailbox: destinationMailbox,
+            timeoutSeconds: mutationTimeoutSeconds
+        )
+        let copyCommand = CopyCommand(
+            identifierSet: identifierSet,
+            destinationMailbox: destinationMailbox,
+            timeoutSeconds: mutationTimeoutSeconds
+        )
+        do {
+            try moveCommand.validate()
+            try copyCommand.validate()
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .move,
+                phase: .validation,
+                certainty: .definitelyNotApplied,
+                reason: .invalidRequest
+            )
+        }
+
+        return try await runMutationLease(operation: .move) { [self] in
+            let transport = try await self.prepareMutationTransportBody()
+            try self.checkMutationCancellation(
+                operation: .move,
+                phase: .dispatch,
+                priorMutationMayHaveApplied: false
+            )
+            let capabilities = try self.commandCapabilities(on: transport)
+
+            if capabilities.contains(.move) {
+                return try await self.executeTrackedMutationBody(
+                    moveCommand,
+                    on: transport,
+                    operation: .move,
+                    phase: nil,
+                    priorMutationMayHaveApplied: false
+                )
+            }
+
+            guard capabilities.contains(.uidPlus),
+                  let uidSet = Self.uidSet(from: identifierSet) else {
+                throw IMAPMutationFailure(
+                    operation: .move,
+                    phase: .validation,
+                    certainty: .definitelyNotApplied,
+                    reason: .unsupportedOperation
+                )
+            }
+
+            try self.checkMutationCancellation(
+                operation: .move,
+                phase: .fallbackCopy,
+                priorMutationMayHaveApplied: false
+            )
+            let copyResponse = try await self.executeTrackedMutationBody(
+                copyCommand,
+                on: transport,
+                operation: .move,
+                phase: .fallbackCopy,
+                priorMutationMayHaveApplied: false
+            )
+
+            try self.checkMutationCancellation(
+                operation: .move,
+                phase: .markDeleted,
+                priorMutationMayHaveApplied: true
+            )
+            let storeCommand = UIDStoreDeletedCommand(
+                identifierSet: uidSet,
+                timeoutSeconds: mutationTimeoutSeconds
+            )
+            _ = try await self.executeTrackedMutationBody(
+                storeCommand,
+                on: transport,
+                operation: .move,
+                phase: .markDeleted,
+                priorMutationMayHaveApplied: true
+            )
+
+            try self.checkMutationCancellation(
+                operation: .move,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: true
+            )
+            let expungeCommand = UIDExpungeCommand(
+                identifierSet: uidSet,
+                timeoutSeconds: mutationTimeoutSeconds
+            )
+            _ = try await self.executeTrackedMutationBody(
+                expungeCommand,
+                on: transport,
+                operation: .move,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: true
+            )
+            return copyResponse
+        }
+    }
+
+    /// Permanently removes exactly the requested UIDs using UIDPLUS.
+    func executeUIDExpunge(messages identifierSet: UIDSet) async throws {
+        let command = UIDExpungeCommand(
+            identifierSet: identifierSet,
+            timeoutSeconds: mutationTimeoutSeconds
+        )
+        do {
+            try command.validate()
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .uidExpunge,
+                phase: .validation,
+                certainty: .definitelyNotApplied,
+                reason: .invalidRequest
+            )
+        }
+
+        try await runMutationLease(operation: .uidExpunge) { [self] in
+            let transport = try await self.prepareMutationTransportBody()
+            guard try self.commandCapabilities(on: transport).contains(.uidPlus) else {
+                throw IMAPMutationFailure(
+                    operation: .uidExpunge,
+                    phase: .validation,
+                    certainty: .definitelyNotApplied,
+                    reason: .unsupportedOperation
+                )
+            }
+            try self.checkMutationCancellation(
+                operation: .uidExpunge,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: false
+            )
+            _ = try await self.executeTrackedMutationBody(
+                command,
+                on: transport,
+                operation: .uidExpunge,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: false
+            )
+        }
+    }
+
+    /// Marks and expunges one exact UID without allowing another command or
+    /// connection generation to interleave between the two phases.
+    func executePermanentDelete(message uid: UID) async throws {
+        let identifierSet = UIDSet(uid)
+        let storeCommand = UIDStoreDeletedCommand(
+            identifierSet: identifierSet,
+            timeoutSeconds: mutationTimeoutSeconds
+        )
+        let expungeCommand = UIDExpungeCommand(
+            identifierSet: identifierSet,
+            timeoutSeconds: mutationTimeoutSeconds
+        )
+        do {
+            try storeCommand.validate()
+            try expungeCommand.validate()
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .permanentDelete,
+                phase: .validation,
+                certainty: .definitelyNotApplied,
+                reason: .invalidRequest
+            )
+        }
+
+        try await runMutationLease(operation: .permanentDelete) { [self] in
+            let transport = try await self.prepareMutationTransportBody()
+            guard try self.commandCapabilities(on: transport).contains(.uidPlus) else {
+                throw IMAPMutationFailure(
+                    operation: .permanentDelete,
+                    phase: .validation,
+                    certainty: .definitelyNotApplied,
+                    reason: .unsupportedOperation
+                )
+            }
+            try self.checkMutationCancellation(
+                operation: .permanentDelete,
+                phase: .markDeleted,
+                priorMutationMayHaveApplied: false
+            )
+            _ = try await self.executeTrackedMutationBody(
+                storeCommand,
+                on: transport,
+                operation: .permanentDelete,
+                phase: .markDeleted,
+                priorMutationMayHaveApplied: false
+            )
+
+            try self.checkMutationCancellation(
+                operation: .permanentDelete,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: true
+            )
+            _ = try await self.executeTrackedMutationBody(
+                expungeCommand,
+                on: transport,
+                operation: .permanentDelete,
+                phase: .uidExpunge,
+                priorMutationMayHaveApplied: true
+            )
+        }
+    }
+
     private func executeCommandBody<CommandType: IMAPCommand>(_ command: CommandType) async throws -> CommandType.ResultType {
         try await executeCommandWithTransportBody(command).result
     }
@@ -1108,15 +1322,7 @@ final class IMAPConnection {
             throw Self.currentTeardownError(lifecycleState: lifecycleState)
         }
         if let capabilityCommand = command as? IMAPCapabilityRequiringCommand {
-            try lifecycleState.withLockedValue { state in
-                guard !state.isRetired else { throw Self.abortedError }
-                guard state.adoptedTransport === transport else {
-                    throw Self.teardownError
-                }
-                guard state.capabilities.contains(capabilityCommand.requiredCapability) else {
-                    throw MessageTransferCommandError.unsupportedOperation
-                }
-            }
+            try validateCommandCapability(capabilityCommand.requiredCapability, on: transport)
         }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
@@ -1156,6 +1362,126 @@ final class IMAPConnection {
             try? await channel.pipeline.removeHandler(handler)
             throw error
         }
+    }
+
+    private func runMutationLease<Result>(
+        operation: IMAPMutationFailure.Operation,
+        _ body: () async throws -> Result
+    ) async throws -> Result {
+        do {
+            return try await commandQueue.run(body)
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            throw IMAPMutationFailure(
+                operation: operation,
+                phase: .dispatch,
+                certainty: .definitelyNotApplied,
+                reason: IMAPMutationFailure.categorizedReason(for: error)
+            )
+        }
+    }
+
+    private func prepareMutationTransportBody() async throws -> OwnedTransport {
+        try ensureNotRetired()
+        try await waitForIdleCompletionIfNeeded()
+        clearInvalidChannel()
+        if currentTransport == nil {
+            try await connectBody()
+        }
+        guard let transport = currentTransport else {
+            throw Self.currentTeardownError(lifecycleState: lifecycleState)
+        }
+        return transport
+    }
+
+    private func commandCapabilities(on transport: OwnedTransport) throws -> Set<Capability> {
+        try lifecycleState.withLockedValue { state in
+            guard !state.isRetired else { throw Self.abortedError }
+            guard state.adoptedTransport === transport else { throw Self.teardownError }
+            return state.capabilities
+        }
+    }
+
+    private func validateCommandCapability(
+        _ capability: Capability,
+        on transport: OwnedTransport
+    ) throws {
+        guard try commandCapabilities(on: transport).contains(capability) else {
+            throw MessageTransferCommandError.unsupportedOperation
+        }
+    }
+
+    private func executeTrackedMutationBody<CommandType: IMAPMutationCommand>(
+        _ command: CommandType,
+        on transport: OwnedTransport,
+        operation: IMAPMutationFailure.Operation,
+        phase: IMAPMutationFailure.Phase?,
+        priorMutationMayHaveApplied: Bool
+    ) async throws -> CommandType.ResultType {
+        do {
+            return try await executeCommandWithTransportBody(
+                command,
+                reconnectIfNeeded: false,
+                requiredTransport: transport
+            ).result
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            let dispatchState = command.dispatchTracker.state
+            let certainty: IMAPMutationFailure.Certainty =
+                priorMutationMayHaveApplied || dispatchState != .notStarted
+                ? .outcomeUnknown
+                : .definitelyNotApplied
+            let resolvedPhase = phase ?? {
+                switch dispatchState {
+                case .notStarted, .writeAttempted:
+                    return IMAPMutationFailure.Phase.dispatch
+                case .writeCompleted:
+                    return IMAPMutationFailure.Phase.response
+                }
+            }()
+            throw IMAPMutationFailure(
+                operation: operation,
+                phase: resolvedPhase,
+                certainty: certainty,
+                reason: IMAPMutationFailure.categorizedReason(for: error)
+            )
+        }
+    }
+
+    private func checkMutationCancellation(
+        operation: IMAPMutationFailure.Operation,
+        phase: IMAPMutationFailure.Phase,
+        priorMutationMayHaveApplied: Bool
+    ) throws {
+        do {
+            try Task.checkCancellation()
+        } catch {
+            throw IMAPMutationFailure(
+                operation: operation,
+                phase: phase,
+                certainty: priorMutationMayHaveApplied ? .outcomeUnknown : .definitelyNotApplied,
+                reason: .cancelled
+            )
+        }
+    }
+
+    private static func uidSet<T: MessageIdentifier>(
+        from identifierSet: MessageIdentifierSet<T>
+    ) -> UIDSet? {
+        guard T.self == UID.self else { return nil }
+        var result = UIDSet()
+        for range in identifierSet.ranges {
+            guard let lower = UInt32(exactly: range.lowerBound),
+                  let upper = UInt32(exactly: range.upperBound),
+                  lower > 0,
+                  upper >= lower else {
+                return nil
+            }
+            result.insert(range: UID(lower)...UID(upper))
+        }
+        return result
     }
 
     private func clearInvalidChannel() {

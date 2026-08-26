@@ -31,14 +31,21 @@ struct CopyCommand<T: MessageIdentifier>: IMAPMutationCommand {
 
     /// Tracks whether this exact command crossed the transport write boundary.
     let dispatchTracker = MutationDispatchTracker()
+
+    let timeoutSeconds: Int
     
     /// Initialize a new copy command
     /// - Parameters:
     ///   - identifierSet: The set of message identifiers to copy
     ///   - destinationMailbox: The destination mailbox name
-    init(identifierSet: MessageIdentifierSet<T>, destinationMailbox: String) {
+    init(
+        identifierSet: MessageIdentifierSet<T>,
+        destinationMailbox: String,
+        timeoutSeconds: Int = 5
+    ) {
         self.identifierSet = identifierSet
         self.destinationMailbox = destinationMailbox
+        self.timeoutSeconds = timeoutSeconds
     }
     
     /// Validate the command before execution

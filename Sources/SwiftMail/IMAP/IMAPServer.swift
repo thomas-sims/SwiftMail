@@ -984,7 +984,7 @@ public actor IMAPServer {
     
     
     /**
-     Moves messages to another mailbox using the server's native MOVE extension.
+     Moves messages to another mailbox using native MOVE or the exact UIDPLUS fallback.
      
      The generic type T determines the identifier type:
      - Use `SequenceNumber` for temporary message numbers that may change
@@ -1000,25 +1000,32 @@ public actor IMAPServer {
         _ = try await moveWithResult(messages: identifierSet, to: destinationMailbox)
     }
 
-    /// Moves messages using native MOVE and reports whether destination UIDs were proven.
+    /// Moves messages and reports whether destination UIDs were proven.
     ///
-    /// MOVE itself does not require UIDPLUS. If MOVE is unavailable this method
-    /// fails before dispatch. A safe COPY/delete fallback is intentionally not
-    /// performed here; that multi-command workflow requires the separate
-    /// reconciliation and precise-expunge policy introduced by A2.2.
+    /// Native MOVE is preferred and does not require UIDPLUS. When MOVE is not
+    /// available, UID requests may use a UIDPLUS-only exact fallback. Sequence
+    /// requests and servers without either safe capability fail before mutation.
     public func moveWithResult<T: MessageIdentifier>(
         messages identifierSet: MessageIdentifierSet<T>,
         to destinationMailbox: String
     ) async throws -> MessageTransferResult {
-        let command = MoveCommand(
-            identifierSet: identifierSet,
-            destinationMailbox: destinationMailbox
-        )
-        return try await executeTransfer(
-            command,
-            operation: .move,
-            requested: identifierSet
-        )
+        do {
+            try ensureCanStartPrimaryWork()
+            let response = try await primaryConnection.executeMoveWithFallback(
+                messages: identifierSet,
+                to: destinationMailbox
+            )
+            return MessageTransferResult.make(from: response, requested: identifierSet)
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .move,
+                phase: .dispatch,
+                certainty: .definitelyNotApplied,
+                reason: IMAPMutationFailure.categorizedReason(for: error)
+            )
+        }
     }
     
     /**
@@ -1208,10 +1215,59 @@ public actor IMAPServer {
      - `IMAPError.emptyIdentifierSet` if the identifier set is empty
      - Note: Logs flag updates at debug level with operation type and message count
      */
-    public func store<T: MessageIdentifier>(flags: [Flag], on identifierSet: MessageIdentifierSet<T>, operation: StoreData.StoreType) async throws {
-        let storeData = StoreData.flags(flags, operation)
+    public func store<T: MessageIdentifier>(
+        flags: [Flag],
+        on identifierSet: MessageIdentifierSet<T>,
+        operation: StoreData.StoreType,
+        silent: Bool = false
+    ) async throws {
+        let storeData = StoreData.flags(flags, operation, silent: silent)
         let command = StoreCommand(identifierSet: identifierSet, data: storeData)
         try await executeCommand(command)
+    }
+
+    /// Permanently removes only the supplied UIDs using RFC 4315 UID EXPUNGE.
+    ///
+    /// The server must advertise UIDPLUS. This method never emits global EXPUNGE.
+    public func uidExpunge(messages identifierSet: UIDSet) async throws {
+        do {
+            try ensureCanStartPrimaryWork()
+            try await primaryConnection.executeUIDExpunge(messages: identifierSet)
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .uidExpunge,
+                phase: .dispatch,
+                certainty: .definitelyNotApplied,
+                reason: IMAPMutationFailure.categorizedReason(for: error)
+            )
+        }
+    }
+
+    /// Permanently removes one exact UID using RFC 4315 UID EXPUNGE.
+    public func uidExpunge(message uid: UID) async throws {
+        try await uidExpunge(messages: UIDSet(uid))
+    }
+
+    /// Marks one exact UID as deleted silently, then expunges only that UID.
+    ///
+    /// Both phases hold one command lease and one transport generation. The
+    /// server must advertise UIDPLUS; global EXPUNGE is never used.
+    public func deletePermanently(message uid: UID) async throws {
+        do {
+            try ensureCanStartPrimaryWork()
+            try await primaryConnection.executePermanentDelete(message: uid)
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            throw IMAPMutationFailure(
+                operation: .permanentDelete,
+                phase: .dispatch,
+                certainty: .definitelyNotApplied,
+                reason: IMAPMutationFailure.categorizedReason(for: error)
+            )
+        }
     }
     
     /**
@@ -1465,38 +1521,9 @@ public actor IMAPServer {
                 operation: operation,
                 phase: phase,
                 certainty: certainty,
-                reason: mutationFailureReason(for: error)
+                reason: IMAPMutationFailure.categorizedReason(for: error)
             )
         }
-    }
-
-    private func mutationFailureReason(for error: Error) -> IMAPMutationFailure.Reason {
-        if let commandError = error as? MessageTransferCommandError {
-            switch commandError {
-            case .serverRejected:
-                return .serverRejected
-            case .unsupportedOperation:
-                return .unsupportedOperation
-            }
-        }
-        if let imapError = error as? IMAPError {
-            switch imapError {
-            case .timeout:
-                return .timedOut
-            case .emptyIdentifierSet, .invalidArgument:
-                return .invalidRequest
-            case .commandNotSupported:
-                return .unsupportedOperation
-            case .connectionFailed:
-                return .transportFailure
-            default:
-                return .protocolFailure
-            }
-        }
-        if error is IMAPConnectionError {
-            return .transportFailure
-        }
-        return .protocolFailure
     }
 }
 
@@ -1817,6 +1844,8 @@ extension IMAPServer {
      
      - Parameter identifierSet: The set of messages to archive
      - Throws: An error if the archive operation fails or archive folder is not found
+     - Important: The Seen flag is stored before MOVE. If MOVE later fails, the
+       message can remain in the source mailbox marked Seen.
      */
     public func archive<T: MessageIdentifier>(messages identifierSet: MessageIdentifierSet<T>) async throws {
         try await ensureMailboxesLoaded()
@@ -1851,6 +1880,8 @@ extension IMAPServer {
      
      - Parameter identifierSet: The set of messages to save as drafts
      - Throws: An error if the operation fails or drafts folder is not found
+     - Important: The Draft flag is stored before MOVE. If MOVE later fails, the
+       message can remain in the source mailbox marked Draft.
     */
     public func saveAsDraft<T: MessageIdentifier>(messages identifierSet: MessageIdentifierSet<T>) async throws {
         try await store(flags: [.draft], on: identifierSet, operation: .add)

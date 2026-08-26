@@ -19,6 +19,8 @@ struct MoveCommand<T: MessageIdentifier>: IMAPMutationCommand, IMAPCapabilityReq
     /// Tracks whether this exact command crossed the transport write boundary.
     let dispatchTracker = MutationDispatchTracker()
 
+    let timeoutSeconds: Int
+
     /// RFC 6851 MOVE is independent of UIDPLUS, including for UID MOVE.
     let requiredCapability: Capability = .move
     
@@ -26,9 +28,14 @@ struct MoveCommand<T: MessageIdentifier>: IMAPMutationCommand, IMAPCapabilityReq
     /// - Parameters:
     ///   - identifierSet: The set of message identifiers to move
     ///   - destinationMailbox: The destination mailbox name
-    init(identifierSet: MessageIdentifierSet<T>, destinationMailbox: String) {
+    init(
+        identifierSet: MessageIdentifierSet<T>,
+        destinationMailbox: String,
+        timeoutSeconds: Int = 5
+    ) {
         self.identifierSet = identifierSet
         self.destinationMailbox = destinationMailbox
+        self.timeoutSeconds = timeoutSeconds
     }
     
     /// Validate the command before execution
