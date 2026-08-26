@@ -392,6 +392,71 @@ struct IMAPAbortTests {
     }
 
     @Test
+    func gracefulDisconnectRejectsNewPrimaryCommand() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let idleEventLoop = NIOAsyncTestingEventLoop()
+        let idleChannel = NIOAsyncTestingChannel(loop: idleEventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await idleChannel.connect(to: address).get()
+
+        let idleConnection = makeConnection(group: group)
+        try await idleConnection.prepareEstablishedChannel(idleChannel, capabilities: [.idle])
+
+        var continuationReference: AsyncStream<IMAPServerEvent>.Continuation?
+        let stream = AsyncStream<IMAPServerEvent> { continuation in
+            continuationReference = continuation
+        }
+        let continuation = try #require(continuationReference)
+        try await idleConnection.startIdleSession(continuation: continuation)
+        let cycleTask = Task<Void, Never> {
+            for await _ in stream {}
+        }
+
+        let writeCounter = RejectOutboundWritesHandler()
+        let primaryEventLoop = NIOAsyncTestingEventLoop()
+        let primaryChannel = await NIOAsyncTestingChannel(handler: writeCounter, loop: primaryEventLoop)
+        try await primaryChannel.connect(to: address).get()
+
+        let server = IMAPServer(host: "invalid.invalid", port: 993)
+        try await server.preparePrimaryEstablishedChannel(primaryChannel)
+        let sessionID = UUID()
+        await server.trackIdleConnection(id: sessionID, mailbox: "INBOX", connection: idleConnection)
+        try await server.attachIdleRuntime(
+            id: sessionID,
+            matching: idleConnection,
+            cycleTask: cycleTask,
+            continuation: continuation
+        )
+
+        let gracefulDisconnect = Task {
+            try await server.disconnect()
+        }
+        try await waitUntil {
+            await server.gracefullyClosingIdleConnectionCount == 1
+        }
+
+        do {
+            _ = try await server.noop()
+            Issue.record("Expected teardown to reject a new primary command")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection teardown in progress")
+            } else {
+                Issue.record("Unexpected teardown IMAP error: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected teardown error: \(error)")
+        }
+        #expect(writeCounter.writeCount == 0)
+
+        await server.hardAbort()
+        _ = await gracefulDisconnect.result
+        _ = try? await idleChannel.finish(acceptAlreadyClosed: true)
+        _ = try? await primaryChannel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
     func abortAwaitsLateConnectCandidateClosure() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
@@ -432,6 +497,93 @@ struct IMAPAbortTests {
             #expect(!connection.hasPendingTransportConnect)
             #expect(!channel.isActive)
             _ = await connectTask.result
+            _ = try? await channel.finish(acceptAlreadyClosed: true)
+        }
+
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func abortJoinsTransportCreationBeforeItReturns() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+        for _ in 0..<16 {
+            let eventLoop = NIOAsyncTestingEventLoop()
+            let channel = NIOAsyncTestingChannel(loop: eventLoop)
+            let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+            try await channel.connect(to: address).get()
+
+            let releaseFactory = DispatchSemaphore(value: 0)
+            let transportPromise = group.next().makePromise(of: Channel.self)
+            let factoryCalls = LockedCounter()
+            let abortStarted = LockedFlag()
+            let abortCompleted = LockedFlag()
+
+            let connection = IMAPConnection(
+                host: "invalid.invalid",
+                port: 993,
+                group: group,
+                loggerLabel: "test.imap.connection",
+                outboundLabel: "test.imap.out",
+                inboundLabel: "test.imap.in",
+                connectOverride: { registerChannel in
+                    factoryCalls.increment()
+                    releaseFactory.wait()
+                    registerChannel(channel)
+                    transportPromise.succeed(channel)
+                    return transportPromise.futureResult
+                }
+            )
+
+            let connectTask = Task {
+                try await connection.connect()
+            }
+            try await waitUntil { factoryCalls.value == 1 }
+            #expect(connection.hasPendingTransportConnect)
+
+            do {
+                try await connection.connect()
+                Issue.record("Expected the reserved creation slot to reject a second connect")
+            } catch let error as IMAPError {
+                if case .connectionFailed(let reason) = error {
+                    #expect(reason == "Connection attempt already in progress")
+                } else {
+                    Issue.record("Unexpected concurrent-connect IMAP error: \(error)")
+                }
+            } catch {
+                Issue.record("Unexpected concurrent-connect error: \(error)")
+            }
+            #expect(factoryCalls.value == 1)
+
+            let abortTask = Task {
+                abortStarted.set()
+                await connection.hardAbort()
+                abortCompleted.set()
+            }
+            try await waitUntil { abortStarted.value }
+            try await Task.sleep(nanoseconds: 25_000_000)
+            #expect(!abortCompleted.value)
+
+            releaseFactory.signal()
+            try await waitUntil { abortCompleted.value }
+            await abortTask.value
+
+            do {
+                try await connectTask.value
+                Issue.record("Expected connect to fail after hard abort")
+            } catch let error as IMAPError {
+                if case .connectionFailed(let reason) = error {
+                    #expect(reason == "Connection was aborted")
+                } else {
+                    Issue.record("Unexpected aborted-connect IMAP error: \(error)")
+                }
+            } catch {
+                Issue.record("Unexpected aborted-connect error: \(error)")
+            }
+
+            #expect(!connection.hasPendingTransportConnect)
+            #expect(connection.ownedTransportCount == 0)
+            #expect(!channel.isActive)
             _ = try? await channel.finish(acceptAlreadyClosed: true)
         }
 
@@ -484,7 +636,19 @@ private struct ExpectedWriteFailure: Error {}
 private final class RejectOutboundWritesHandler: ChannelOutboundHandler, @unchecked Sendable {
     typealias OutboundIn = IMAPClientHandler.OutboundIn
 
+    private let writeCountLock = NSLock()
+    private var storedWriteCount = 0
+
+    var writeCount: Int {
+        writeCountLock.lock()
+        defer { writeCountLock.unlock() }
+        return storedWriteCount
+    }
+
     func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        writeCountLock.lock()
+        storedWriteCount += 1
+        writeCountLock.unlock()
         promise?.fail(ExpectedWriteFailure())
     }
 }
@@ -527,6 +691,40 @@ private actor EntryCounter {
 
     func recordEntry() {
         count += 1
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func increment() {
+        lock.lock()
+        storedValue += 1
+        lock.unlock()
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSet = false
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isSet
+    }
+
+    func set() {
+        lock.lock()
+        isSet = true
+        lock.unlock()
     }
 }
 

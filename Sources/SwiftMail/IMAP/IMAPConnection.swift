@@ -13,7 +13,10 @@ final class IMAPConnection {
     private struct PendingConnect {
         let id: UUID
         let promise: EventLoopPromise<Channel>
-        let transportFuture: EventLoopFuture<Channel>
+        /// Completed once synchronous transport creation returns. Reserving this
+        /// promise in lifecycle state first lets hard abort join creation itself,
+        /// not only a transport future that has already been returned.
+        let transportHandoffPromise: EventLoopPromise<EventLoopFuture<Channel>>
     }
 
     private struct LifecycleState {
@@ -86,6 +89,32 @@ final class IMAPConnection {
             Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
         }
 
+        // Claim the single transport-creation slot before invoking ClientBootstrap
+        // (or the deterministic test override). Otherwise abort or a second connect
+        // can run while creation is in progress but still invisible to lifecycle state.
+        let pendingEventLoop = group.next()
+        let pendingConnect = PendingConnect(
+            id: UUID(),
+            promise: pendingEventLoop.makePromise(of: Channel.self),
+            transportHandoffPromise: pendingEventLoop.makePromise(of: EventLoopFuture<Channel>.self)
+        )
+        let registrationError = lifecycleState.withLockedValue { state -> IMAPError? in
+            guard !state.isRetired else { return Self.abortedError }
+            guard state.pendingConnect == nil else {
+                return IMAPError.connectionFailed("Connection attempt already in progress")
+            }
+            state.pendingConnect = pendingConnect
+            return nil
+        }
+
+        if let registrationError {
+            // These promises were never published. Resolve both so every rejected
+            // attempt has exactly one terminal path and cannot leak NIO promises.
+            pendingConnect.promise.fail(registrationError)
+            pendingConnect.transportHandoffPromise.fail(registrationError)
+            throw registrationError
+        }
+
         let connectFuture: EventLoopFuture<Channel>
         if let connectOverride {
             connectFuture = connectOverride(registerChannel)
@@ -127,30 +156,11 @@ final class IMAPConnection {
                 }
                 .connect(host: host, port: port)
         }
-        let pendingConnect = PendingConnect(
-            id: UUID(),
-            promise: connectFuture.eventLoop.makePromise(of: Channel.self),
-            transportFuture: connectFuture
-        )
-        let registered = lifecycleState.withLockedValue { state in
-            guard !state.isRetired, state.pendingConnect == nil else {
-                return false
-            }
-            state.pendingConnect = pendingConnect
-            return true
-        }
-
-        guard registered else {
-            connectFuture.whenSuccess { channel in
-                channel.close(promise: nil)
-            }
-            try ensureNotRetired()
-            throw IMAPError.connectionFailed("Connection attempt already in progress")
-        }
 
         connectFuture.whenComplete { result in
             Self.completePendingConnect(pendingConnect, with: result, lifecycleState: lifecycleState)
         }
+        pendingConnect.transportHandoffPromise.succeed(connectFuture)
 
         let channel = try await pendingConnect.promise.futureResult.get()
 
@@ -390,11 +400,13 @@ final class IMAPConnection {
         }
 
         // Failing the public wrapper promise is not transport cancellation.
-        // Wait for NIO's actual ClientBootstrap/Happy-Eyeballs attempt to
-        // resolve after its candidate channels were closed. Its explicit
-        // connect timeout bounds the no-candidate/DNS portion.
+        // First join synchronous transport creation, then wait for NIO's actual
+        // ClientBootstrap/Happy-Eyeballs attempt. Its explicit connect timeout
+        // bounds the no-candidate/DNS portion.
         if let pendingConnect = snapshot.pendingConnect {
-            _ = try? await pendingConnect.transportFuture.get()
+            if let transportFuture = try? await pendingConnect.transportHandoffPromise.futureResult.get() {
+                _ = try? await transportFuture.get()
+            }
         }
 
         // A candidate can be initialized concurrently with the first snapshot.

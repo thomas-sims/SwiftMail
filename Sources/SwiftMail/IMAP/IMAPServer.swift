@@ -158,7 +158,7 @@ public actor IMAPServer {
      - Note: Logs connection attempts and capability retrieval at info level
      */
     public func connect() async throws {
-        try ensureNotRetired()
+        try ensureCanStartPrimaryWork()
         try await primaryConnection.connect()
     }
     
@@ -173,7 +173,8 @@ public actor IMAPServer {
      - Note: Updates the internal capabilities set with the server's response
      */
     @discardableResult public func fetchCapabilities() async throws -> [Capability] {
-        try await primaryConnection.fetchCapabilities()
+        try ensureCanStartPrimaryWork()
+        return try await primaryConnection.fetchCapabilities()
     }
     
     /**
@@ -209,6 +210,7 @@ public actor IMAPServer {
      - Note: Logs login attempts at info level (without credentials)
      */
     public func login(username: String, password: String) async throws {
+        try ensureCanStartPrimaryWork()
         try await primaryConnection.login(username: username, password: password)
         authentication = .login(username: username, password: password)
     }
@@ -219,6 +221,7 @@ public actor IMAPServer {
     ///   - accessToken: The OAuth 2.0 access token.
     /// - Throws: ``IMAPError.unsupportedAuthMechanism`` if the server does not advertise XOAUTH2 or ``IMAPError.authFailed`` when authentication fails.
     public func authenticateXOAUTH2(email: String, accessToken: String) async throws {
+        try ensureCanStartPrimaryWork()
         try await primaryConnection.authenticateXOAUTH2(email: email, accessToken: accessToken)
         authentication = .xoauth2(email: email, accessToken: accessToken)
     }
@@ -371,6 +374,14 @@ public actor IMAPServer {
         idleConnections.values.reduce(into: 0) { count, entry in
             if entry.state == .gracefullyClosing { count += 1 }
         }
+    }
+
+    /// Installs an already-created primary channel for deterministic package tests.
+    func preparePrimaryEstablishedChannel(
+        _ channel: Channel,
+        capabilities: Set<NIOIMAPCore.Capability> = []
+    ) async throws {
+        try await primaryConnection.prepareEstablishedChannel(channel, capabilities: capabilities)
     }
 
     func endIdleSession(id: UUID) async throws {
@@ -541,7 +552,8 @@ public actor IMAPServer {
     /// - Returns: An AsyncStream of server events during the IDLE session
     /// - Throws: IMAPError if IDLE is not supported or already active
     public func idle() async throws -> AsyncStream<IMAPServerEvent> {
-        try await primaryConnection.idle()
+        try ensureCanStartPrimaryWork()
+        return try await primaryConnection.idle()
     }
 
     /// Begin an IDLE session for a specific mailbox on a dedicated connection.
@@ -559,10 +571,7 @@ public actor IMAPServer {
     /// - Parameter mailbox: The mailbox to watch for changes.
     /// - Parameter cycleInterval: Seconds between IDLE cycles (default 240 = 4 minutes).
     public func idle(on mailbox: String, cycleInterval: TimeInterval = 240) async throws -> IMAPIdleSession {
-        try ensureNotRetired()
-        guard !isClosingConnections else {
-            throw IMAPError.connectionFailed("Connection teardown in progress")
-        }
+        try ensureCanStartPrimaryWork()
         guard let authentication = authentication else {
             throw IMAPError.commandFailed("Authentication required before starting IDLE on a mailbox")
         }
@@ -712,12 +721,14 @@ public actor IMAPServer {
     /// This method is safe to call even if the server has already terminated the IDLE session
     /// (e.g., by sending a BYE response) or if automatic cleanup has already occurred.
     public func done() async throws {
+        try ensureCanStartPrimaryWork()
         try await primaryConnection.done()
     }
     
     /// Send a NOOP command and collect unsolicited responses.
     public func noop() async throws -> [IMAPServerEvent] {
-        try await primaryConnection.noop()
+        try ensureCanStartPrimaryWork()
+        return try await primaryConnection.noop()
     }
     
     /**
@@ -1292,7 +1303,15 @@ public actor IMAPServer {
      - Throws: An error if the command execution fails
      */
     private func executeCommand<CommandType: IMAPCommand>(_ command: CommandType) async throws -> CommandType.ResultType {
-        try await primaryConnection.executeCommand(command)
+        try ensureCanStartPrimaryWork()
+        return try await primaryConnection.executeCommand(command)
+    }
+
+    private func ensureCanStartPrimaryWork() throws {
+        try ensureNotRetired()
+        if isClosingConnections {
+            throw IMAPError.connectionFailed("Connection teardown in progress")
+        }
     }
 
     private func ensureNotRetired() throws {
