@@ -48,23 +48,9 @@ final class CapabilityHandler: BaseIMAPCommandHandler<[Capability]>, IMAPCommand
     }
 }
 
-/// Handler for IMAP COPY command
-final class CopyHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unchecked Sendable {
-    
-    /// Handle a tagged OK response by succeeding the promise
-    /// - Parameter response: The tagged response
-    override func handleTaggedOKResponse(_ response: TaggedResponse) {
-        // Call super to handle CLIENTBUG warnings
-        super.handleTaggedOKResponse(response)
-        
-        succeedWithResult(())
-    }
-    
-    /// Handle a tagged error response
-    /// - Parameter response: The tagged response
-    override func handleTaggedErrorResponse(_ response: TaggedResponse) {
-        failWithError(IMAPError.copyFailed(String(describing: response.state)))
-    }
+/// Handler for IMAP COPY command.
+final class CopyHandler: MessageTransferHandler, IMAPCommandHandler, @unchecked Sendable {
+    typealias ResultType = MessageTransferCommandResponse
 }
 
 /// Handler for IMAP STORE command

@@ -19,8 +19,8 @@ struct CapabilityCommand: IMAPTaggedCommand {
 }
 
 /// Command for copying messages from one mailbox to another
-struct CopyCommand<T: MessageIdentifier>: IMAPTaggedCommand {
-    typealias ResultType = Void
+struct CopyCommand<T: MessageIdentifier>: IMAPMutationCommand {
+    typealias ResultType = MessageTransferCommandResponse
     typealias HandlerType = CopyHandler
     
     /// The set of message identifiers to copy
@@ -28,6 +28,9 @@ struct CopyCommand<T: MessageIdentifier>: IMAPTaggedCommand {
     
     /// The destination mailbox name
     let destinationMailbox: String
+
+    /// Tracks whether this exact command crossed the transport write boundary.
+    let dispatchTracker = MutationDispatchTracker()
     
     /// Initialize a new copy command
     /// - Parameters:
@@ -42,6 +45,11 @@ struct CopyCommand<T: MessageIdentifier>: IMAPTaggedCommand {
     func validate() throws {
         guard !identifierSet.isEmpty else {
             throw IMAPError.emptyIdentifierSet
+        }
+        guard identifierSet.ranges.allSatisfy({
+            $0.lowerBound > 0 && $0.upperBound <= Int(UInt32.max)
+        }) else {
+            throw IMAPError.invalidArgument("Message identifiers must be valid non-zero 32-bit values")
         }
     }
     

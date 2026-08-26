@@ -1107,6 +1107,17 @@ final class IMAPConnection {
         if let requiredTransport, transport !== requiredTransport {
             throw Self.currentTeardownError(lifecycleState: lifecycleState)
         }
+        if let capabilityCommand = command as? IMAPCapabilityRequiringCommand {
+            try lifecycleState.withLockedValue { state in
+                guard !state.isRetired else { throw Self.abortedError }
+                guard state.adoptedTransport === transport else {
+                    throw Self.teardownError
+                }
+                guard state.capabilities.contains(capabilityCommand.requiredCapability) else {
+                    throw MessageTransferCommandError.unsupportedOperation
+                }
+            }
+        }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
         let responseBuffer = transport.responseBuffer

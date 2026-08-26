@@ -7,33 +7,51 @@ import NIOIMAPCore
 import NIO
 import NIOConcurrencyHelpers
 
-/** Handler for IMAP MOVE command */
-final class MoveHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unchecked Sendable {
-    /** The result type for this handler */
-    typealias ResultType = Void
-    
-    /**
-     Process an incoming response
-     - Parameter response: The response to process
-     - Returns: Whether the response was handled by this handler
-     */
-    override func processResponse(_ response: Response) -> Bool {
-        // Log the response using the base handler
-        let baseHandled = super.processResponse(response)
-        
-        // Check if this is our tagged response
-        if case .tagged(let taggedResponse) = response, taggedResponse.tag == commandTag {
-            if case .ok = taggedResponse.state {
-                // The move was successful
-                succeedWithResult(())
-            } else {
-                // The move failed
-                failWithError(IMAPError.commandFailed("Move failed: \(String(describing: taggedResponse.state))"))
-            }
-            return true
+/** Shared response collector for COPY and MOVE commands. */
+class MessageTransferHandler: BaseIMAPCommandHandler<MessageTransferCommandResponse>, @unchecked Sendable {
+    private var copyUID: ResponseCodeCopy?
+    private var hasConflictingCopyUID = false
+
+    override func handleTaggedOKResponse(_ response: TaggedResponse) {
+        if case .ok(let responseText) = response.state {
+            recordCOPYUID(from: responseText)
         }
-        
-        // Not our tagged response
-        return baseHandled
+
+        let result = lock.withLock {
+            MessageTransferCommandResponse(
+                copyUID: copyUID,
+                hasConflictingCopyUID: hasConflictingCopyUID
+            )
+        }
+        succeedWithResult(result)
     }
-} 
+
+    override func handleTaggedErrorResponse(_ response: TaggedResponse) {
+        failWithError(MessageTransferCommandError.serverRejected)
+    }
+
+    override func handleUntaggedResponse(_ response: Response) -> Bool {
+        if case .untagged(.conditionalState(.ok(let responseText))) = response {
+            recordCOPYUID(from: responseText)
+        }
+        return super.handleUntaggedResponse(response)
+    }
+
+    private func recordCOPYUID(from responseText: ResponseText) {
+        guard case .uidCopy(let candidate)? = responseText.code else { return }
+        lock.withLock {
+            if let copyUID {
+                if copyUID != candidate {
+                    hasConflictingCopyUID = true
+                }
+            } else {
+                copyUID = candidate
+            }
+        }
+    }
+}
+
+/** Handler for IMAP MOVE command. */
+final class MoveHandler: MessageTransferHandler, IMAPCommandHandler, @unchecked Sendable {
+    typealias ResultType = MessageTransferCommandResponse
+}

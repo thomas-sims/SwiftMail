@@ -6,8 +6,8 @@ import NIO
 import NIOIMAP
 
 /// Command for moving messages from one mailbox to another
-struct MoveCommand<T: MessageIdentifier>: IMAPTaggedCommand {
-    typealias ResultType = Void
+struct MoveCommand<T: MessageIdentifier>: IMAPMutationCommand, IMAPCapabilityRequiringCommand {
+    typealias ResultType = MessageTransferCommandResponse
     typealias HandlerType = MoveHandler
     
     /// The set of message identifiers to move
@@ -15,6 +15,12 @@ struct MoveCommand<T: MessageIdentifier>: IMAPTaggedCommand {
     
     /// The destination mailbox name
     let destinationMailbox: String
+
+    /// Tracks whether this exact command crossed the transport write boundary.
+    let dispatchTracker = MutationDispatchTracker()
+
+    /// RFC 6851 MOVE is independent of UIDPLUS, including for UID MOVE.
+    let requiredCapability: Capability = .move
     
     /// Initialize a new move command
     /// - Parameters:
@@ -29,6 +35,11 @@ struct MoveCommand<T: MessageIdentifier>: IMAPTaggedCommand {
     func validate() throws {
         guard !identifierSet.isEmpty else {
             throw IMAPError.emptyIdentifierSet
+        }
+        guard identifierSet.ranges.allSatisfy({
+            $0.lowerBound > 0 && $0.upperBound <= Int(UInt32.max)
+        }) else {
+            throw IMAPError.invalidArgument("Message identifiers must be valid non-zero 32-bit values")
         }
     }
     

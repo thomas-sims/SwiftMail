@@ -984,10 +984,7 @@ public actor IMAPServer {
     
     
     /**
-     Moves messages to another mailbox.
-     
-     This method attempts to use the MOVE extension if available, falling back to
-     COPY+EXPUNGE if necessary.
+     Moves messages to another mailbox using the server's native MOVE extension.
      
      The generic type T determines the identifier type:
      - Use `SequenceNumber` for temporary message numbers that may change
@@ -996,20 +993,32 @@ public actor IMAPServer {
      - Parameters:
      - identifierSet: The set of messages to move
      - destinationMailbox: The name of the destination mailbox
-     - Throws:
-     - `IMAPError.moveFailed` if the move operation fails
-     - `IMAPError.emptyIdentifierSet` if the identifier set is empty
-     - Note: Logs move operations at info level with message count and destination
+     - Throws: ``IMAPMutationFailure`` with explicit dispatch certainty if the
+       request cannot be completed safely.
      */
     public func move<T: MessageIdentifier>(messages identifierSet: MessageIdentifierSet<T>, to destinationMailbox: String) async throws {
-        if capabilities.contains(.move) && (T.self != UID.self || capabilities.contains(.uidPlus)) {
-            try await executeMove(messages: identifierSet, to: destinationMailbox)
-        } else {
-            // Fall back to COPY + DELETE + EXPUNGE
-            try await copy(messages: identifierSet, to: destinationMailbox)
-            try await store(flags: [.deleted], on: identifierSet, operation: .add)
-            try await expunge()
-        }
+        _ = try await moveWithResult(messages: identifierSet, to: destinationMailbox)
+    }
+
+    /// Moves messages using native MOVE and reports whether destination UIDs were proven.
+    ///
+    /// MOVE itself does not require UIDPLUS. If MOVE is unavailable this method
+    /// fails before dispatch. A safe COPY/delete fallback is intentionally not
+    /// performed here; that multi-command workflow requires the separate
+    /// reconciliation and precise-expunge policy introduced by A2.2.
+    public func moveWithResult<T: MessageIdentifier>(
+        messages identifierSet: MessageIdentifierSet<T>,
+        to destinationMailbox: String
+    ) async throws -> MessageTransferResult {
+        let command = MoveCommand(
+            identifierSet: identifierSet,
+            destinationMailbox: destinationMailbox
+        )
+        return try await executeTransfer(
+            command,
+            operation: .move,
+            requested: identifierSet
+        )
     }
     
     /**
@@ -1022,6 +1031,17 @@ public actor IMAPServer {
     public func move<T: MessageIdentifier>(message identifier: T, to destinationMailbox: String) async throws {
         let set = MessageIdentifierSet<T>(identifier)
         try await move(messages: set, to: destinationMailbox)
+    }
+
+    /// Moves one message and reports whether its destination UID was proven.
+    public func moveWithResult<T: MessageIdentifier>(
+        message identifier: T,
+        to destinationMailbox: String
+    ) async throws -> MessageTransferResult {
+        try await moveWithResult(
+            messages: MessageIdentifierSet<T>(identifier),
+            to: destinationMailbox
+        )
     }
     
     /**
@@ -1041,6 +1061,17 @@ public actor IMAPServer {
             let sequenceNumber = header.sequenceNumber
             try await move(message: sequenceNumber, to: destinationMailbox)
         }
+    }
+
+    /// Moves the message represented by a header and reports destination identity.
+    public func moveWithResult(
+        header: MessageInfo,
+        to destinationMailbox: String
+    ) async throws -> MessageTransferResult {
+        if let uid = header.uid {
+            return try await moveWithResult(message: uid, to: destinationMailbox)
+        }
+        return try await moveWithResult(message: header.sequenceNumber, to: destinationMailbox)
     }
     
     /**
@@ -1122,19 +1153,36 @@ public actor IMAPServer {
     }
     
     /**
-     Searches for messages matching the given criteria
+     Copies messages to another mailbox.
      
      - Parameters:
      - identifierSet: The set of messages to copy
      - destinationMailbox: The name of the destination mailbox
-     - Throws:
-     - `IMAPError.copyFailed` if the copy operation fails
-     - `IMAPError.emptyIdentifierSet` if the identifier set is empty
-     - Note: Logs copy operations at info level with message count and destination
+     - Throws: ``IMAPMutationFailure`` with explicit dispatch certainty if the
+       request cannot be completed safely.
      */
     public func copy<T: MessageIdentifier>(messages identifierSet: MessageIdentifierSet<T>, to destinationMailbox: String) async throws {
-        let command = CopyCommand(identifierSet: identifierSet, destinationMailbox: destinationMailbox)
-        try await executeCommand(command)
+        _ = try await copyWithResult(messages: identifierSet, to: destinationMailbox)
+    }
+
+    /// Copies messages and reports whether the server proved destination UIDs.
+    ///
+    /// A successful command without a valid, source-proven COPYUID mapping is
+    /// returned as ``MessageTransferResult/completedRequiringReconciliation(_:)``.
+    /// It is never retried automatically.
+    public func copyWithResult<T: MessageIdentifier>(
+        messages identifierSet: MessageIdentifierSet<T>,
+        to destinationMailbox: String
+    ) async throws -> MessageTransferResult {
+        let command = CopyCommand(
+            identifierSet: identifierSet,
+            destinationMailbox: destinationMailbox
+        )
+        return try await executeTransfer(
+            command,
+            operation: .copy,
+            requested: identifierSet
+        )
     }
     
     /**
@@ -1365,26 +1413,90 @@ public actor IMAPServer {
         return ServerMessageDate(serverComponents)
     }
     
-    /**
-     Execute a move command
-     
-     This method executes a move command using the MOVE extension.
-     
-     The generic type T determines the identifier type:
-     - Use `SequenceNumber` for temporary message numbers that may change
-     - Use `UID` for permanent message identifiers that remain stable
-     
-     - Parameters:
-     - identifierSet: The set of messages to move
-     - destinationMailbox: The name of the destination mailbox
-     - Throws:
-     - `IMAPError.moveFailed` if the move operation fails
-     - `IMAPError.emptyIdentifierSet` if the identifier set is empty
-     - Note: Logs move operations at debug level
-     */
-    private func executeMove<T: MessageIdentifier>(messages identifierSet: MessageIdentifierSet<T>, to destinationMailbox: String) async throws {
-        let command = MoveCommand(identifierSet: identifierSet, destinationMailbox: destinationMailbox)
-        try await executeCommand(command)
+    /// Executes one COPY or native MOVE and converts its protocol and dispatch
+    /// state into the public reconciliation-aware result model.
+    private func executeTransfer<CommandType: IMAPMutationCommand, T: MessageIdentifier>(
+        _ command: CommandType,
+        operation: IMAPMutationFailure.Operation,
+        requested identifiers: MessageIdentifierSet<T>
+    ) async throws -> MessageTransferResult where CommandType.ResultType == MessageTransferCommandResponse {
+        do {
+            try command.validate()
+        } catch {
+            throw IMAPMutationFailure(
+                operation: operation,
+                phase: .validation,
+                certainty: .definitelyNotApplied,
+                reason: .invalidRequest
+            )
+        }
+
+        do {
+            let response = try await executeCommand(command)
+            return MessageTransferResult.make(from: response, requested: identifiers)
+        } catch let failure as IMAPMutationFailure {
+            throw failure
+        } catch {
+            if let commandError = error as? MessageTransferCommandError,
+               case .unsupportedOperation = commandError {
+                throw IMAPMutationFailure(
+                    operation: operation,
+                    phase: .validation,
+                    certainty: .definitelyNotApplied,
+                    reason: .unsupportedOperation
+                )
+            }
+            let state = command.dispatchTracker.state
+            let phase: IMAPMutationFailure.Phase
+            let certainty: IMAPMutationFailure.Certainty
+            switch state {
+            case .notStarted:
+                phase = .dispatch
+                certainty = .definitelyNotApplied
+            case .writeAttempted:
+                phase = .dispatch
+                certainty = .outcomeUnknown
+            case .writeCompleted:
+                phase = .response
+                certainty = .outcomeUnknown
+            }
+
+            throw IMAPMutationFailure(
+                operation: operation,
+                phase: phase,
+                certainty: certainty,
+                reason: mutationFailureReason(for: error)
+            )
+        }
+    }
+
+    private func mutationFailureReason(for error: Error) -> IMAPMutationFailure.Reason {
+        if let commandError = error as? MessageTransferCommandError {
+            switch commandError {
+            case .serverRejected:
+                return .serverRejected
+            case .unsupportedOperation:
+                return .unsupportedOperation
+            }
+        }
+        if let imapError = error as? IMAPError {
+            switch imapError {
+            case .timeout:
+                return .timedOut
+            case .emptyIdentifierSet, .invalidArgument:
+                return .invalidRequest
+            case .commandNotSupported:
+                return .unsupportedOperation
+            case .connectionFailed:
+                return .transportFailure
+            default:
+                return .protocolFailure
+            }
+        }
+        if error is IMAPConnectionError {
+            return .transportFailure
+        }
+        return .protocolFailure
     }
 }
 
