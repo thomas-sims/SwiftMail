@@ -981,6 +981,43 @@ struct XOAUTH2SecurityTests {
     }
 
     @Test
+    func xoauthCapabilityCompletionCannotRepublishAfterHardAbort() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.xoauth-capability-abort",
+            outboundLabel: "test.imap.xoauth-capability-abort.out",
+            inboundLabel: "test.imap.xoauth-capability-abort.in"
+        )
+        try await connection.prepareEstablishedChannel(
+            channel,
+            capabilities: candidateAuthenticationCapabilities
+        )
+
+        let auth = Task {
+            try await connection.authenticateXOAUTH2(
+                email: "fixture@example.invalid",
+                accessToken: "fixture-access-token"
+            )
+        }
+        let command = try await nextTaggedCommand(on: channel)
+        _ = try await channel.writeInbound(authenticationSuccess(tag: command.tag))
+        await connection.hardAbort()
+
+        expectXOAUTHConnectionAbort(await auth.result)
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!channel.isActive)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
     func xoauthReconnectUsesNewGenerationSASLIRCapability() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let oldChannel = NIOAsyncTestingChannel()
@@ -1489,6 +1526,21 @@ private func nextTaggedCommand(on channel: NIOAsyncTestingChannel) async throws 
         throw IMAPError.commandFailed("Expected tagged test command")
     }
     return command
+}
+
+private func expectXOAUTHConnectionAbort<Success>(_ result: Result<Success, Error>) {
+    switch result {
+    case .success:
+        Issue.record("Expected XOAUTH2 capability publication to lose authority")
+    case .failure(let error as IMAPError):
+        guard case .connectionFailed(let reason) = error else {
+            Issue.record("Unexpected XOAUTH2 abort IMAP error: \(error)")
+            return
+        }
+        #expect(reason == "Connection was aborted")
+    case .failure(let error):
+        Issue.record("Unexpected XOAUTH2 abort error: \(error)")
+    }
 }
 
 private func authenticationSuccess(tag: String) -> Response {

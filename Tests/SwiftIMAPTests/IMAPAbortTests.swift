@@ -996,6 +996,172 @@ struct IMAPAbortTests {
     }
 
     @Test
+    func hardAbortAtomicallyClearsEstablishedCapabilities() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(
+            channel,
+            capabilities: [.imap4rev1, .idle]
+        )
+        #expect(connection.capabilitiesSnapshot == [.imap4rev1, .idle])
+
+        await connection.hardAbort()
+
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!channel.isActive)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func greetingCapabilitiesCannotRepublishAfterHardAbort() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.capability-greeting-abort",
+            outboundLabel: "test.imap.capability-greeting-abort.out",
+            inboundLabel: "test.imap.capability-greeting-abort.in",
+            connectOverride: { registerChannel in
+                registerChannel(channel).map { channel }
+            }
+        )
+
+        let connect = Task { try await connection.connect() }
+        try await waitUntil {
+            connection.isConnected
+                && connection.hasPendingTransportConnect
+                && connection.hasActiveResponseHandler
+        }
+        _ = try await channel.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+            code: .capability([.idle]),
+            text: "ready"
+        )))))
+        await connection.hardAbort()
+
+        expectConnectionAbort(await connect.result)
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        #expect(!connection.hasPendingTransportConnect)
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!channel.isActive)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func capabilityCommandCompletionCannotRepublishAfterHardAbort() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.imap4rev1])
+
+        let fetch = Task { try await connection.fetchCapabilities() }
+        let command = try await nextAbortTaggedCommand(on: channel)
+        #expect(command.command == .capability)
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.idle])))
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: command.tag,
+            state: .ok(.init(text: "capability-complete"))
+        )))
+        await connection.hardAbort()
+
+        switch await fetch.result {
+        case .success(let capabilities):
+            // Publication won the lock before retirement; hardAbort must still
+            // clear it atomically below.
+            #expect(Set(capabilities) == [.idle])
+        case .failure(let error as IMAPError):
+            guard case .connectionFailed(let reason) = error else {
+                Issue.record("Unexpected CAPABILITY abort IMAP error: \(error)")
+                break
+            }
+            #expect(reason == "Connection was aborted")
+        case .failure(let error):
+            Issue.record("Unexpected CAPABILITY abort error: \(error)")
+        }
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        #expect(connection.ownedTransportCount == 0)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func loginCompletionCannotRepublishCapabilitiesAfterHardAbort() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.imap4rev1])
+
+        let login = Task {
+            try await connection.login(
+                username: "fixture@example.invalid",
+                password: "fixture-password"
+            )
+        }
+        let command = try await nextAbortTaggedCommand(on: channel)
+        guard case .login = command.command else {
+            Issue.record("Expected LOGIN command")
+            await connection.hardAbort()
+            _ = await login.result
+            _ = try? await channel.finish(acceptAlreadyClosed: true)
+            try await group.shutdownGracefully()
+            return
+        }
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: command.tag,
+            state: .ok(.init(code: .capability([.idle]), text: "login-complete"))
+        )))
+        await connection.hardAbort()
+
+        expectConnectionAbort(await login.result)
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        #expect(connection.ownedTransportCount == 0)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func currentTransportCapabilityResultPublishesSuccessfully() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel)
+
+        let fetch = Task { try await connection.fetchCapabilities() }
+        let command = try await nextAbortTaggedCommand(on: channel)
+        #expect(command.command == .capability)
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.imap4rev1, .idle])))
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: command.tag,
+            state: .ok(.init(text: "capability-complete"))
+        )))
+
+        let result = try await fetch.value
+        #expect(Set(result) == [.imap4rev1, .idle])
+        #expect(connection.capabilitiesSnapshot == [.imap4rev1, .idle])
+
+        try await connection.disconnect()
+        #expect(connection.capabilitiesSnapshot.isEmpty)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
     func directConnectSerializesCommandAndRejectsAnotherConnectImmediately() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let eventLoop = NIOAsyncTestingEventLoop()
@@ -1787,4 +1953,19 @@ private func nextAbortTaggedCommand(on channel: NIOAsyncTestingChannel) async th
         throw IMAPError.commandFailed("Expected tagged test command")
     }
     return command
+}
+
+private func expectConnectionAbort<Success>(_ result: Result<Success, Error>) {
+    switch result {
+    case .success:
+        Issue.record("Expected capability producer to lose authority on hard abort")
+    case .failure(let error as IMAPError):
+        guard case .connectionFailed(let reason) = error else {
+            Issue.record("Unexpected IMAP error after hard abort: \(error)")
+            return
+        }
+        #expect(reason == "Connection was aborted")
+    case .failure(let error):
+        Issue.record("Unexpected error after hard abort: \(error)")
+    }
 }

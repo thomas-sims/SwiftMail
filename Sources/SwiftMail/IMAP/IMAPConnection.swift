@@ -143,6 +143,11 @@ final class IMAPConnection {
         let shouldClose: Bool
     }
 
+    private struct CommandExecution<Result> {
+        let result: Result
+        let transport: OwnedTransport
+    }
+
     private struct LifecycleState {
         /// Channel and logger authority are adopted atomically. A logger from a
         /// losing Happy-Eyeballs candidate can never become the command logger.
@@ -419,7 +424,11 @@ final class IMAPConnection {
                 throw error
             }
             adoptedTransport.responseBuffer.hasActiveHandler = false
-            try await refreshCapabilitiesBody(using: greetingCapabilities)
+            try await refreshCapabilitiesBody(
+                using: greetingCapabilities,
+                expectedTransport: adoptedTransport,
+                expectedPendingConnect: pendingConnect
+            )
 
             guard Self.establishPendingConnect(
                 pendingConnect,
@@ -451,18 +460,44 @@ final class IMAPConnection {
     }
 
     @discardableResult
-    private func fetchCapabilitiesBody() async throws -> [Capability] {
+    private func fetchCapabilitiesBody(
+        expectedTransport: OwnedTransport? = nil,
+        expectedPendingConnect: PendingConnect? = nil
+    ) async throws -> [Capability] {
+        if let expectedTransport {
+            try validateCapabilityAuthority(
+                expectedTransport: expectedTransport,
+                expectedPendingConnect: expectedPendingConnect
+            )
+        }
+
         let command = CapabilityCommand()
-        let serverCapabilities = try await executeCommandBody(command)
-        lifecycleState.withLockedValue { $0.capabilities = Set(serverCapabilities) }
-        return serverCapabilities
+        let execution = try await executeCommandWithTransportBody(
+            command,
+            reconnectIfNeeded: expectedTransport == nil,
+            requiredTransport: expectedTransport
+        )
+        let authoritativeTransport = expectedTransport ?? execution.transport
+        guard execution.transport === authoritativeTransport else {
+            throw Self.currentTeardownError(lifecycleState: lifecycleState)
+        }
+        try publishCapabilities(
+            Set(execution.result),
+            expectedTransport: authoritativeTransport,
+            expectedPendingConnect: expectedPendingConnect
+        )
+        return execution.result
     }
 
     func login(username: String, password: String) async throws {
         try await commandQueue.run { [self] in
             let command = LoginCommand(username: username, password: password)
-            let loginCapabilities = try await self.executeCommandBody(command)
-            try await self.refreshCapabilitiesBody(using: loginCapabilities)
+            let execution = try await self.executeCommandWithTransportBody(command)
+            try await self.refreshCapabilitiesBody(
+                using: execution.result,
+                expectedTransport: execution.transport,
+                expectedPendingConnect: nil
+            )
         }
     }
 
@@ -604,6 +639,7 @@ final class IMAPConnection {
 
             state.isGracefulDisconnectInProgress = true
             state.adoptedTransport = nil
+            state.capabilities = []
             return (true, Array(state.ownedTransports.values), state.pendingConnect)
         }
 
@@ -666,6 +702,10 @@ final class IMAPConnection {
             state.isRetired = true
             let idleHandler = state.idleHandler
             state.adoptedTransport = nil
+            // Retirement and generation metadata invalidation are one atomic
+            // lifecycle transition. A result completing concurrently with this
+            // mutation cannot republish through the guarded writer below.
+            state.capabilities = []
             state.idleHandler = nil
             state.idleTransport = nil
             state.idleTerminationInProgress = false
@@ -764,11 +804,22 @@ final class IMAPConnection {
     }
 
     /// Refreshes capabilities while the caller owns the command-queue lease.
-    private func refreshCapabilitiesBody(using reportedCapabilities: [Capability]) async throws {
+    private func refreshCapabilitiesBody(
+        using reportedCapabilities: [Capability],
+        expectedTransport: OwnedTransport,
+        expectedPendingConnect: PendingConnect?
+    ) async throws {
         if !reportedCapabilities.isEmpty {
-            lifecycleState.withLockedValue { $0.capabilities = Set(reportedCapabilities) }
+            try publishCapabilities(
+                Set(reportedCapabilities),
+                expectedTransport: expectedTransport,
+                expectedPendingConnect: expectedPendingConnect
+            )
         } else {
-            try await fetchCapabilitiesBody()
+            try await fetchCapabilitiesBody(
+                expectedTransport: expectedTransport,
+                expectedPendingConnect: expectedPendingConnect
+            )
         }
     }
 
@@ -893,7 +944,11 @@ final class IMAPConnection {
             }
             duplexLogger.flushInboundBuffer()
 
-            try await refreshCapabilitiesBody(using: refreshedCapabilities)
+            try await refreshCapabilitiesBody(
+                using: refreshedCapabilities,
+                expectedTransport: transport,
+                expectedPendingConnect: nil
+            )
         } catch {
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
@@ -1021,6 +1076,17 @@ final class IMAPConnection {
     }
 
     private func executeCommandBody<CommandType: IMAPCommand>(_ command: CommandType) async throws -> CommandType.ResultType {
+        try await executeCommandWithTransportBody(command).result
+    }
+
+    /// Executes a command and returns the exact transport whose handler produced
+    /// the result. Capability-producing callers carry this identity across the
+    /// suspension point into the lifecycle-locked publication boundary.
+    private func executeCommandWithTransportBody<CommandType: IMAPCommand>(
+        _ command: CommandType,
+        reconnectIfNeeded: Bool = true,
+        requiredTransport: OwnedTransport? = nil
+    ) async throws -> CommandExecution<CommandType.ResultType> {
         try ensureNotRetired()
         try command.validate()
         try await waitForIdleCompletionIfNeeded()
@@ -1028,12 +1094,18 @@ final class IMAPConnection {
         clearInvalidChannel()
 
         if currentTransport == nil {
+            guard reconnectIfNeeded else {
+                throw Self.currentTeardownError(lifecycleState: lifecycleState)
+            }
             logger.info("Channel is nil, re-establishing connection before sending command")
             try await connectBody()
         }
 
         guard let transport = currentTransport else {
             throw IMAPError.connectionFailed("Channel not initialized")
+        }
+        if let requiredTransport, transport !== requiredTransport {
+            throw Self.currentTeardownError(lifecycleState: lifecycleState)
         }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
@@ -1062,7 +1134,7 @@ final class IMAPConnection {
             await handleConnectionTerminationInResponses(handler.untaggedResponses)
             duplexLogger.flushInboundBuffer()
 
-            return result
+            return CommandExecution(result: result, transport: transport)
         } catch {
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
@@ -1079,6 +1151,7 @@ final class IMAPConnection {
         let didClear = lifecycleState.withLockedValue { state in
             if let transport = state.adoptedTransport, !transport.channel.isActive {
                 state.adoptedTransport = nil
+                state.capabilities = []
                 return true
             }
             return false
@@ -1162,6 +1235,7 @@ final class IMAPConnection {
                     }
                     if state.adoptedTransport === transport {
                         state.adoptedTransport = nil
+                        state.capabilities = []
                     }
                     if state.idleTransport === transport {
                         let idleHandler = state.idleHandler
@@ -1242,6 +1316,7 @@ final class IMAPConnection {
                 if let adopted = state.adoptedTransport {
                     guard !adopted.channel.isActive else { return ([], nil) }
                     state.adoptedTransport = nil
+                    state.capabilities = []
 
                     if state.idleTransport === adopted {
                         let idleHandler = state.idleHandler
@@ -1303,6 +1378,10 @@ final class IMAPConnection {
                     return IMAPError.connectionFailed("Connected channel was not registered")
                 }
                 state.adoptedTransport = registered
+                // The new generation is visible atomically with empty metadata.
+                // Its greeting may publish only while this attempt still owns
+                // the exact pending-connect reservation.
+                state.capabilities = []
                 return nil
             }
 
@@ -1361,6 +1440,7 @@ final class IMAPConnection {
                   let registered = state.ownedTransports[ObjectIdentifier(adoptedChannel)],
                   state.adoptedTransport === registered else { return nil }
             state.adoptedTransport = nil
+            state.capabilities = []
             return adoptedChannel
         }
     }
@@ -1389,6 +1469,68 @@ final class IMAPConnection {
 
     private static func currentTeardownError(state: LifecycleState) -> IMAPError {
         state.isRetired ? abortedError : teardownError
+    }
+
+    /// Returns the fixed terminal category when a suspended capability producer
+    /// no longer owns the generation it started on. During greeting setup the
+    /// pending-connect object is part of that authority; established operations
+    /// require that no setup reservation remains.
+    private static func capabilityAuthorityError(
+        state: LifecycleState,
+        expectedTransport: OwnedTransport,
+        expectedPendingConnect: PendingConnect?
+    ) -> IMAPError? {
+        guard !state.isRetired else { return abortedError }
+        guard !state.isGracefulDisconnectInProgress else { return teardownError }
+        guard state.adoptedTransport === expectedTransport,
+              expectedTransport.channel.isActive else {
+            return teardownError
+        }
+
+        if let expectedPendingConnect {
+            guard state.pendingConnect === expectedPendingConnect else {
+                return teardownError
+            }
+        } else {
+            guard state.pendingConnect == nil else { return teardownError }
+        }
+        return nil
+    }
+
+    private func validateCapabilityAuthority(
+        expectedTransport: OwnedTransport,
+        expectedPendingConnect: PendingConnect?
+    ) throws {
+        let authorityError = lifecycleState.withLockedValue { state in
+            Self.capabilityAuthorityError(
+                state: state,
+                expectedTransport: expectedTransport,
+                expectedPendingConnect: expectedPendingConnect
+            )
+        }
+        if let authorityError { throw authorityError }
+    }
+
+    /// The sole non-clearing capability write. Validation and publication share
+    /// one lifecycle-lock mutation, so abort, teardown, or generation replacement
+    /// cannot win between an authority check and the store.
+    private func publishCapabilities(
+        _ capabilities: Set<Capability>,
+        expectedTransport: OwnedTransport,
+        expectedPendingConnect: PendingConnect?
+    ) throws {
+        let authorityError = lifecycleState.withLockedValue { state -> IMAPError? in
+            if let error = Self.capabilityAuthorityError(
+                state: state,
+                expectedTransport: expectedTransport,
+                expectedPendingConnect: expectedPendingConnect
+            ) {
+                return error
+            }
+            state.capabilities = capabilities
+            return nil
+        }
+        if let authorityError { throw authorityError }
     }
 
     // Internal lifecycle observability used by deterministic package tests.
@@ -1470,22 +1612,33 @@ final class IMAPConnection {
 
         try await Self.installResponseBufferIfNeeded(on: registered).get()
 
-        let adopted = lifecycleState.withLockedValue { state -> Bool in
-            guard !state.isRetired, !state.isGracefulDisconnectInProgress else { return false }
+        let adoptionError = lifecycleState.withLockedValue { state -> IMAPError? in
+            guard !state.isRetired else { return Self.abortedError }
+            guard !state.isGracefulDisconnectInProgress,
+                  state.pendingConnect == nil else {
+                return Self.teardownError
+            }
             guard state.ownedTransports[ObjectIdentifier(channel)] === registered else {
-                return false
+                return Self.teardownError
             }
             state.adoptedTransport = registered
-            // Prepared-channel setup can be invoked concurrently by tests and
-            // deterministic embedders. Publish its generation metadata at the
-            // same serialized adoption boundary instead of racing readers or
-            // duplicate writers after the transport has become visible.
-            state.capabilities = capabilities
-            return true
+            state.capabilities = []
+            return nil
         }
-        guard adopted else {
+        if let adoptionError {
             channel.close(mode: .all, promise: nil)
-            throw Self.abortedError
+            throw adoptionError
+        }
+
+        do {
+            try publishCapabilities(
+                capabilities,
+                expectedTransport: registered,
+                expectedPendingConnect: nil
+            )
+        } catch {
+            channel.close(mode: .all, promise: nil)
+            throw error
         }
     }
 
