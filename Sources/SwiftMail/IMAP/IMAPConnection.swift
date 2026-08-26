@@ -343,15 +343,28 @@ final class IMAPConnection {
             return
         }
 
-        guard let channel = snapshot.1 else {
-            handler.abort()
-            lifecycleState.withLockedValue { state in
-                state.idleTerminationInProgress = false
-                if state.idleHandler === handler {
+        // Only the caller that claimed the termination marker may retire this
+        // IDLE generation. Duplicate callers merely observe its shared result.
+        defer {
+            if snapshot.2 {
+                let didResetMatchingIdle = lifecycleState.withLockedValue { state in
+                    guard state.idleHandler === handler else { return false }
                     state.idleHandler = nil
+                    state.idleTerminationInProgress = false
+                    return true
+                }
+                if didResetMatchingIdle {
+                    responseBuffer.hasActiveHandler = false
                 }
             }
-            return
+        }
+
+        guard let channel = snapshot.1 else {
+            handler.abort()
+            // An already-failed shared handler keeps its original terminal
+            // error; a genuinely missing transport fails every waiter instead
+            // of making one caller silently report success.
+            return try await handler.promise.futureResult.get()
         }
 
         // The caller that atomically installed the termination marker owns the
@@ -360,19 +373,20 @@ final class IMAPConnection {
             do {
                 try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)).get()
             } catch {
-                // Ignore write errors during DONE; channel teardown will resolve
-                // the shared handler promise if the transport is no longer viable.
-            }
-        }
+                // A failed DONE write leaves the protocol state ambiguous. Resolve
+                // the one shared result with this exact write error before closing
+                // the transport, so every caller waiting on this handler receives
+                // the same terminal classification instead of waiting forever.
+                handler.abort(error: error)
 
-        defer {
-            lifecycleState.withLockedValue { state in
-                if state.idleHandler === handler {
-                    state.idleHandler = nil
-                    state.idleTerminationInProgress = false
+                if lifecycleState.withLockedValue({ $0.idleHandler === handler }) {
+                    responseBuffer.hasActiveHandler = false
                 }
+
+                try? await channel.pipeline.removeHandler(handler)
+                channel.close(mode: .all, promise: nil)
+                try? await channel.closeFuture.get()
             }
-            responseBuffer.hasActiveHandler = false
         }
 
         try await handler.promise.futureResult.get()

@@ -35,8 +35,7 @@ final class IdleHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unch
         continuation.finish()
     }
 
-    func abort() {
-        let error = IMAPError.connectionFailed("Connection was aborted")
+    func abort(error: Error = IMAPError.connectionFailed("Connection was aborted")) {
         if failWithError(error) {
             handleChannelTermination(error: error)
         }
