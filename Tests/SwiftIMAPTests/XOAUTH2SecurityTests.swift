@@ -739,11 +739,14 @@ struct XOAUTH2SecurityTests {
             #expect(!loserLogger.isAuthenticationRedactionActive)
             #expect(winnerLogger.authenticationSensitiveTagCount == 1)
             #expect(loserLogger.authenticationSensitiveTagCount == 0)
+            #expect(connection.pendingGreetingCount == 1)
+            #expect(await connection.hasInstalledGreetingHandler(on: loser))
 
             try await loser.close().get()
             #expect(winnerLogger.isAuthenticationRedactionActive)
             #expect(winnerLogger.authenticationSensitiveTagCount == 1)
             #expect(loserLogger.authenticationSensitiveTagCount == 0)
+            #expect(connection.pendingGreetingCount == 0)
 
             _ = try await winner.writeInbound(authenticationSuccess(tag: authCommand.tag))
             _ = try? await winner.readInbound(as: Response.self)
@@ -759,6 +762,7 @@ struct XOAUTH2SecurityTests {
             #expect(loserBuffer.bufferedCount == 0)
             #expect(!winner.isActive)
             #expect(!loser.isActive)
+            #expect(connection.pendingGreetingCount == 0)
 
             _ = try? await loser.finish(acceptAlreadyClosed: true)
             _ = try? await winner.finish(acceptAlreadyClosed: true)
@@ -913,8 +917,150 @@ struct XOAUTH2SecurityTests {
         #expect(registry.creationCount == 1)
         #expect(registry.responseBufferCreationCount == 1)
         #expect(!connection.hasActiveResponseHandler)
+        #expect(connection.pendingGreetingCount == 0)
+        #expect(!(await connection.hasInstalledGreetingHandler(on: channel)))
         #expect(connection.drainBufferedEvents().isEmpty)
         _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func earlyCandidateGreetingsAreIsolatedAndWinnerPlainGreetingRefreshesInBothOrders() async throws {
+        for order in CandidateInitializationOrder.allCases {
+            try await verifyEarlyCandidateGreetingAuthority(order: order)
+        }
+    }
+
+    @Test
+    func xoauthSuccessWithoutCapabilitiesRefreshesWithinItsQueueLease() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.xoauth-refresh",
+            outboundLabel: "test.imap.xoauth-refresh.out",
+            inboundLabel: "test.imap.xoauth-refresh.in"
+        )
+        try await connection.prepareEstablishedChannel(
+            channel,
+            capabilities: candidateAuthenticationCapabilities
+        )
+
+        let auth = Task {
+            try await connection.authenticateXOAUTH2(
+                email: "fixture@example.invalid",
+                accessToken: "fixture-access-token"
+            )
+        }
+        let authCommand = try await nextTaggedCommand(on: channel)
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: authCommand.tag,
+            state: .ok(.init(text: "authentication-complete"))
+        )))
+        _ = try? await channel.readInbound(as: Response.self)
+
+        let capability = try await nextTaggedCommand(on: channel)
+        #expect(capability.command == .capability)
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.imap4rev1])))
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: capability.tag,
+            state: .ok(.init(text: "capability-complete"))
+        )))
+        _ = try? await channel.readInbound(as: Response.self)
+        try await auth.value
+
+        #expect(connection.capabilitiesSnapshot == [.imap4rev1])
+        #expect(connection.pendingGreetingCount == 0)
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func xoauthReconnectUsesNewGenerationSASLIRCapability() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let oldChannel = NIOAsyncTestingChannel()
+        let newChannel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await oldChannel.connect(to: address).get()
+        try await newChannel.connect(to: address).get()
+        let newCapabilities: [Capability] = [
+            .imap4rev1,
+            .authenticate(AuthenticationMechanism("XOAUTH2")),
+        ]
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.xoauth-generation",
+            outboundLabel: "test.imap.xoauth-generation.out",
+            inboundLabel: "test.imap.xoauth-generation.in",
+            connectOverride: { registerChannel in
+                registerChannel(newChannel).map { newChannel }
+            }
+        )
+        try await connection.prepareEstablishedChannel(
+            oldChannel,
+            capabilities: candidateAuthenticationCapabilities
+        )
+        try await oldChannel.close().get()
+
+        let auth = Task {
+            try await connection.authenticateXOAUTH2(
+                email: "fixture@example.invalid",
+                accessToken: "fixture-access-token"
+            )
+        }
+        try await waitForCandidateCondition {
+            connection.isConnected && connection.hasActiveResponseHandler
+        }
+        _ = try await newChannel.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+            code: .capability(newCapabilities),
+            text: "new-generation-ready"
+        )))))
+        _ = try? await newChannel.readInbound(as: Response.self)
+
+        let authCommand = try await nextTaggedCommand(on: newChannel)
+        guard case .authenticate(_, let initialResponse) = authCommand.command else {
+            Issue.record("Expected XOAUTH2 AUTHENTICATE command")
+            await connection.hardAbort()
+            _ = await auth.result
+            _ = try? await oldChannel.finish(acceptAlreadyClosed: true)
+            _ = try? await newChannel.finish(acceptAlreadyClosed: true)
+            try await group.shutdownGracefully()
+            return
+        }
+        // The retired generation advertised SASL-IR; the new one does not.
+        // Credentials must therefore wait for a challenge on this transport.
+        #expect(initialResponse == nil)
+
+        _ = try await newChannel.writeInbound(Response.authenticationChallenge(ByteBuffer()))
+        let continuation = try await newChannel.waitForOutboundWrite(as: IMAPClientHandler.OutboundIn.self)
+        guard case .part(.continuationResponse) = continuation else {
+            Issue.record("Expected challenge-driven XOAUTH2 continuation")
+            await connection.hardAbort()
+            _ = await auth.result
+            _ = try? await oldChannel.finish(acceptAlreadyClosed: true)
+            _ = try? await newChannel.finish(acceptAlreadyClosed: true)
+            try await group.shutdownGracefully()
+            return
+        }
+
+        _ = try await newChannel.writeInbound(Response.tagged(.init(
+            tag: authCommand.tag,
+            state: .ok(.init(code: .capability(newCapabilities), text: "authentication-complete"))
+        )))
+        _ = try? await newChannel.readInbound(as: Response.self)
+        try await auth.value
+        #expect(!connection.capabilitiesSnapshot.contains(.saslIR))
+
+        try await connection.disconnect()
+        _ = try? await oldChannel.finish(acceptAlreadyClosed: true)
+        _ = try? await newChannel.finish(acceptAlreadyClosed: true)
         try await group.shutdownGracefully()
     }
 
@@ -941,6 +1087,95 @@ private let candidateAuthenticationCapabilities: Set<Capability> = [
     .authenticate(AuthenticationMechanism("XOAUTH2")),
     .saslIR,
 ]
+
+private func verifyEarlyCandidateGreetingAuthority(
+    order: CandidateInitializationOrder
+) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = NIOAsyncTestingEventLoop()
+    let winner = NIOAsyncTestingChannel(loop: eventLoop)
+    let loser = NIOAsyncTestingChannel(loop: eventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await winner.connect(to: address).get()
+    try await loser.connect(to: address).get()
+    let adoptionPromise = group.next().makePromise(of: Channel.self)
+    let registry = CandidateLoggerRegistry()
+
+    let connection = IMAPConnection(
+        host: "invalid.invalid",
+        port: 993,
+        group: group,
+        loggerLabel: "test.imap.early-greeting",
+        outboundLabel: "test.imap.early-greeting.out",
+        inboundLabel: "test.imap.early-greeting.in",
+        connectOverride: { registerChannel in
+            let registrations: EventLoopFuture<Void>
+            switch order {
+            case .loserBeforeWinner:
+                registrations = registerChannel(loser).flatMap { registerChannel(winner) }
+            case .winnerBeforeLateLoser:
+                registrations = registerChannel(winner).flatMap { registerChannel(loser) }
+            }
+            registrations.whenFailure { adoptionPromise.fail($0) }
+            return adoptionPromise.futureResult
+        },
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) },
+        candidateResponseBufferFactory: { channel in registry.makeResponseBuffer(for: channel) }
+    )
+
+    let connect = Task { try await connection.connect() }
+    try await waitForCandidateCondition {
+        registry.creationCount == 2 && connection.pendingGreetingCount == 2
+    }
+    try await waitForCandidateCondition {
+        let winnerInstalled = await connection.hasInstalledGreetingHandler(on: winner)
+        let loserInstalled = await connection.hasInstalledGreetingHandler(on: loser)
+        return winnerInstalled && loserInstalled
+    }
+    #expect(await connection.hasInstalledGreetingHandler(on: winner))
+    #expect(await connection.hasInstalledGreetingHandler(on: loser))
+
+    // The loser advertises IDLE while the winner greeting is deliberately plain.
+    // If candidate promises are shared, the loser can incorrectly suppress the
+    // winner's mandatory CAPABILITY command after adoption.
+    _ = try await loser.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+        code: .capability([.idle]),
+        text: "loser-ready"
+    )))))
+    _ = try? await loser.readInbound(as: Response.self)
+    _ = try await winner.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+        text: "winner-ready"
+    )))))
+    _ = try? await winner.readInbound(as: Response.self)
+    #expect(connection.pendingGreetingCount == 0)
+
+    adoptionPromise.succeed(winner)
+    let capability = try await nextTaggedCommand(on: winner)
+    #expect(capability.command == .capability)
+    _ = try await winner.writeInbound(Response.untagged(.capabilityData([.imap4rev1])))
+    _ = try await winner.writeInbound(Response.tagged(.init(
+        tag: capability.tag,
+        state: .ok(.init(text: "winner-capability-complete"))
+    )))
+    _ = try? await winner.readInbound(as: Response.self)
+    try await connect.value
+
+    #expect(connection.capabilitiesSnapshot == [.imap4rev1])
+    #expect(!connection.capabilitiesSnapshot.contains(.idle))
+    #expect(!(await connection.hasInstalledGreetingHandler(on: winner)))
+    #expect(!(await connection.hasInstalledGreetingHandler(on: loser)))
+    let winnerBuffer = try #require(registry.responseBuffer(for: winner))
+    let loserBuffer = try #require(registry.responseBuffer(for: loser))
+    #expect(await pipelineContains(responseBuffer: winnerBuffer, on: winner))
+    #expect(!(await pipelineContains(responseBuffer: loserBuffer, on: loser)))
+
+    try await connection.disconnect()
+    #expect(connection.pendingGreetingCount == 0)
+    #expect(connection.ownedTransportCount == 0)
+    _ = try? await loser.finish(acceptAlreadyClosed: true)
+    _ = try? await winner.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
 
 private func verifyOldGenerationBufferIsolation(
     trigger: CandidateReconnectTrigger
@@ -1268,10 +1503,10 @@ private func authenticationSuccess(tag: String) -> Response {
 
 private func waitForCandidateCondition(
     timeoutNanoseconds: UInt64 = 2_000_000_000,
-    condition: () -> Bool
+    condition: () async -> Bool
 ) async throws {
     let deadline = ContinuousClock().now.advanced(by: .nanoseconds(Int64(timeoutNanoseconds)))
-    while !condition() {
+    while !(await condition()) {
         if ContinuousClock().now >= deadline {
             throw IMAPError.timeout
         }

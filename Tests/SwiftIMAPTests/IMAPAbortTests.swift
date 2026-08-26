@@ -888,6 +888,291 @@ struct IMAPAbortTests {
     }
 
     @Test
+    func queueHeldAutomaticReconnectRefreshesPlainGreetingBeforeSendingCommand() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let factoryCalls = LockedCounter()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.queue-reconnect",
+            outboundLabel: "test.imap.queue-reconnect.out",
+            inboundLabel: "test.imap.queue-reconnect.in",
+            connectOverride: { registerChannel in
+                factoryCalls.increment()
+                return registerChannel(channel).map { channel }
+            }
+        )
+
+        let completed = LockedFlag()
+        let operation = Task {
+            defer { completed.set() }
+            return try await connection.noop()
+        }
+
+        try await waitUntil {
+            let greetingInstalled = await connection.hasInstalledGreetingHandler(on: channel)
+            return connection.isConnected
+                && connection.hasActiveResponseHandler
+                && greetingInstalled
+        }
+        #expect(connection.pendingGreetingCount == 1)
+        _ = try await channel.writeInbound(plainGreeting())
+
+        let capability = try await nextAbortTaggedCommand(on: channel)
+        #expect(capability.command == .capability)
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.imap4rev1])))
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: capability.tag,
+            state: .ok(.init(text: "capability-complete"))
+        )))
+
+        let noop = try await nextAbortTaggedCommand(on: channel)
+        #expect(noop.command == .noop)
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: noop.tag,
+            state: .ok(.init(text: "noop-complete"))
+        )))
+
+        try await waitUntil { completed.value }
+        let events = try await operation.value
+        #expect(events.isEmpty)
+        #expect(factoryCalls.value == 1)
+        #expect(connection.pendingGreetingCount == 0)
+        #expect(connection.capabilitiesSnapshot.contains(.imap4rev1))
+
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func loginWithoutReportedCapabilitiesRefreshesWithinItsQueueLease() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel)
+
+        let login = Task {
+            try await connection.login(
+                username: "fixture@example.invalid",
+                password: "fixture-password"
+            )
+        }
+        let loginCommand = try await nextAbortTaggedCommand(on: channel)
+        guard case .login = loginCommand.command else {
+            Issue.record("Expected LOGIN command")
+            await connection.hardAbort()
+            _ = await login.result
+            _ = try? await channel.finish(acceptAlreadyClosed: true)
+            try await group.shutdownGracefully()
+            return
+        }
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: loginCommand.tag,
+            state: .ok(.init(text: "login-complete"))
+        )))
+
+        let capability = try await nextAbortTaggedCommand(on: channel)
+        #expect(capability.command == .capability)
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.imap4rev1])))
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: capability.tag,
+            state: .ok(.init(text: "capability-complete"))
+        )))
+        try await login.value
+
+        #expect(connection.capabilitiesSnapshot == [.imap4rev1])
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func directConnectSerializesCommandAndRejectsAnotherConnectImmediately() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let factoryCalls = LockedCounter()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.connect-queue",
+            outboundLabel: "test.imap.connect-queue.out",
+            inboundLabel: "test.imap.connect-queue.in",
+            connectOverride: { registerChannel in
+                factoryCalls.increment()
+                return registerChannel(channel).map { channel }
+            }
+        )
+
+        let connect = Task { try await connection.connect() }
+        try await waitUntil {
+            connection.isConnected && connection.hasActiveResponseHandler
+        }
+        let command = Task { try await connection.noop() }
+
+        do {
+            try await connection.connect()
+            Issue.record("Expected a second direct connect to reject immediately")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection attempt already in progress")
+            } else {
+                Issue.record("Unexpected second-connect IMAP error: \(error)")
+            }
+        }
+        #expect(factoryCalls.value == 1)
+
+        _ = try await channel.writeInbound(capabilityGreeting())
+        try await connect.value
+
+        let noop = try await nextAbortTaggedCommand(on: channel)
+        #expect(noop.command == .noop)
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: noop.tag,
+            state: .ok(.init(text: "queued-noop-complete"))
+        )))
+        let commandEvents = try await command.value
+        #expect(commandEvents.isEmpty)
+
+        // Hold a normal command's queue lease. Active-transport preflight must
+        // reject a direct connect without queueing behind that unresolved command.
+        let heldCommand = Task { try await connection.noop() }
+        let heldNoop = try await nextAbortTaggedCommand(on: channel)
+        #expect(heldNoop.command == .noop)
+        let rejectionCompleted = LockedFlag()
+        let rejection = Task { () -> String in
+            defer { rejectionCompleted.set() }
+            do {
+                try await connection.connect()
+                return "unexpected-success"
+            } catch let error as IMAPError {
+                if case .connectionFailed(let reason) = error { return reason }
+                return "unexpected-imap-error"
+            } catch {
+                return "unexpected-error"
+            }
+        }
+        try await waitUntil(timeoutNanoseconds: 250_000_000) { rejectionCompleted.value }
+        #expect(await rejection.value == "Connection already established")
+
+        _ = try await channel.writeInbound(Response.tagged(.init(
+            tag: heldNoop.tag,
+            state: .ok(.init(text: "held-noop-complete"))
+        )))
+        _ = try await heldCommand.value
+
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func hardAbortSettlesAdoptedGreetingCollector() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.greeting-abort",
+            outboundLabel: "test.imap.greeting-abort.out",
+            inboundLabel: "test.imap.greeting-abort.in",
+            connectOverride: { registerChannel in
+                registerChannel(channel).map { channel }
+            }
+        )
+
+        let connect = Task { try await connection.connect() }
+        try await waitUntil {
+            let greetingInstalled = await connection.hasInstalledGreetingHandler(on: channel)
+            return connection.isConnected
+                && connection.hasActiveResponseHandler
+                && connection.pendingGreetingCount == 1
+                && greetingInstalled
+        }
+
+        await connection.hardAbort()
+        do {
+            try await connect.value
+            Issue.record("Expected greeting-pending connect to fail on hard abort")
+        } catch {
+            // Terminal category is covered by the broader hard-abort suite.
+        }
+
+        #expect(connection.pendingGreetingCount == 0)
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!(await connection.hasInstalledGreetingHandler(on: channel)))
+        #expect(!channel.isActive)
+
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func remoteCloseSettlesAdoptedGreetingCollectorAndConnect() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let channel = NIOAsyncTestingChannel(loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.greeting-close",
+            outboundLabel: "test.imap.greeting-close.out",
+            inboundLabel: "test.imap.greeting-close.in",
+            connectOverride: { registerChannel in
+                registerChannel(channel).map { channel }
+            }
+        )
+
+        let connect = Task { try await connection.connect() }
+        try await waitUntil {
+            connection.isConnected
+                && connection.hasActiveResponseHandler
+                && connection.pendingGreetingCount == 1
+        }
+        try await channel.close().get()
+
+        do {
+            try await connect.value
+            Issue.record("Expected remote close to fail greeting-pending connect")
+        } catch is IMAPConnectionError {
+            // Expected typed channel-inactive result from the greeting collector.
+        } catch {
+            Issue.record("Unexpected greeting-close error category: \(error)")
+        }
+
+        try await waitUntil { connection.ownedTransportCount == 0 }
+        #expect(connection.pendingGreetingCount == 0)
+        #expect(!connection.hasPendingTransportConnect)
+        #expect(!connection.hasActiveResponseHandler)
+        #expect(!(await connection.hasInstalledGreetingHandler(on: channel)))
+
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
     func gracefulDisconnectJoinsBlockedFactoryBeforeAllowingReconnect() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let firstEventLoop = NIOAsyncTestingEventLoop()
@@ -1493,4 +1778,13 @@ private func capabilityGreeting() -> Response {
 
 private func plainGreeting() -> Response {
     .untagged(.conditionalState(.ok(.init(text: "ready"))))
+}
+
+private func nextAbortTaggedCommand(on channel: NIOAsyncTestingChannel) async throws -> TaggedCommand {
+    let outbound = try await channel.waitForOutboundWrite(as: IMAPClientHandler.OutboundIn.self)
+    guard case .part(.tagged(let command)) = outbound else {
+        Issue.record("Expected a tagged IMAP command")
+        throw IMAPError.commandFailed("Expected tagged test command")
+    }
+    return command
 }

@@ -92,6 +92,8 @@ final class IMAPConnection {
     private final class OwnedTransport: @unchecked Sendable {
         let channel: Channel
         let duplexLogger: IMAPLogger
+        let greetingHandler: IMAPGreetingHandler
+        let greetingFuture: EventLoopFuture<[Capability]>
         let responseBuffer: UntaggedResponseBuffer
         let loggerInstallationPromise: EventLoopPromise<Void>
         let responseBufferInstallationPromise: EventLoopPromise<Void>
@@ -108,8 +110,11 @@ final class IMAPConnection {
             duplexLogger: IMAPLogger,
             responseBuffer: UntaggedResponseBuffer
         ) {
+            let greetingPromise = channel.eventLoop.makePromise(of: [Capability].self)
             self.channel = channel
             self.duplexLogger = duplexLogger
+            self.greetingHandler = IMAPGreetingHandler(commandTag: "", promise: greetingPromise)
+            self.greetingFuture = greetingPromise.futureResult
             self.responseBuffer = responseBuffer
             self.loggerInstallationPromise = channel.eventLoop.makePromise(of: Void.self)
             self.responseBufferInstallationPromise = channel.eventLoop.makePromise(of: Void.self)
@@ -218,6 +223,33 @@ final class IMAPConnection {
     }
 
     func connect() async throws {
+        // Preserve the immediate external concurrency fence while the current
+        // attempt owns its lifecycle reservation. A queued second connect must
+        // not wait behind a greeting that only the test/operator can supply.
+        if let preflightError = lifecycleState.withLockedValue({ state -> IMAPError? in
+            guard !state.isRetired else { return Self.abortedError }
+            guard !state.isGracefulDisconnectInProgress else { return Self.teardownError }
+            guard state.pendingConnect == nil else {
+                return IMAPError.connectionFailed("Connection attempt already in progress")
+            }
+            if let adoptedTransport = state.adoptedTransport,
+               adoptedTransport.channel.isActive {
+                return IMAPError.connectionFailed("Connection already established")
+            }
+            return nil
+        }) {
+            throw preflightError
+        }
+
+        try await commandQueue.run { [self] in
+            try await self.connectBody()
+        }
+    }
+
+    /// Establishes a connection while the caller owns the command-queue lease.
+    /// Automatic reconnects call this body directly so the non-reentrant queue
+    /// can never wait on a lease already held by the same operation.
+    private func connectBody() async throws {
         try ensureNotRetired()
         try await closeLingeringTransportsBeforeConnect()
         try ensureNotRetired()
@@ -266,7 +298,7 @@ final class IMAPConnection {
         }
         let registerChannel: @Sendable (Channel) -> EventLoopFuture<Void> = { channel in
             let registration = createAndRegisterCandidate(channel)
-            return Self.installCandidateLoggerIfNeeded(registration)
+            return Self.installCandidatePipelineIfNeeded(registration)
         }
 
         let connectFuture: EventLoopFuture<Channel>
@@ -299,6 +331,9 @@ final class IMAPConnection {
                                 Self.currentTeardownError(lifecycleState: lifecycleState)
                             )
                         }
+                        transport.greetingHandler.failWithError(
+                            Self.currentTeardownError(lifecycleState: lifecycleState)
+                        )
                         return channel.close(mode: .all).flatMapThrowing {
                             throw Self.currentTeardownError(lifecycleState: lifecycleState)
                         }
@@ -321,13 +356,15 @@ final class IMAPConnection {
                         try channel.pipeline.syncOperations.addHandlers([
                             sslHandler,
                             IMAPClientHandler(parserOptions: parserOptions),
-                            transport.duplexLogger
+                            transport.duplexLogger,
+                            transport.greetingHandler
                         ])
                         transport.loggerInstallationPromise.succeed(())
 
                         return channel.eventLoop.makeSucceededFuture(())
                     } catch {
                         transport.loggerInstallationPromise.fail(error)
+                        transport.greetingHandler.failWithError(error)
                         // Channel-initializer failures must fail the bootstrap future.
                         // Never crash or fall back to plaintext/permissive TLS.
                         return channel.eventLoop.makeFailedFuture(error)
@@ -358,14 +395,31 @@ final class IMAPConnection {
             // channelRead flows first→last, so: command handler processes response → calls
             // fireChannelRead → buffer sees it. When no command handler is active, responses
             // flow directly to the buffer which captures them for later draining.
-            try await Self.installResponseBufferIfNeeded(on: adoptedTransport).get()
+            // The greeting collector already owns this candidate before the
+            // bootstrap initializer/override registration completes. Mark the
+            // winner buffer active before installing it so a greeting racing
+            // adoption can neither fall off the tail nor be buffered twice.
+            adoptedTransport.responseBuffer.hasActiveHandler = true
+            do {
+                try await Self.installResponseBufferIfNeeded(on: adoptedTransport).get()
+            } catch {
+                adoptedTransport.responseBuffer.hasActiveHandler = false
+                throw error
+            }
 
             try ensureNotRetired()
 
             logger.info("Connected to IMAP server with 1MB buffer limit for large responses")
 
-            let greetingCapabilities: [Capability] = try await executeHandlerOnly(handlerType: IMAPGreetingHandler.self, timeoutSeconds: 5)
-            try await refreshCapabilities(using: greetingCapabilities)
+            let greetingCapabilities: [Capability]
+            do {
+                greetingCapabilities = try await awaitGreeting(on: adoptedTransport, timeoutSeconds: 5)
+            } catch {
+                adoptedTransport.responseBuffer.hasActiveHandler = false
+                throw error
+            }
+            adoptedTransport.responseBuffer.hasActiveHandler = false
+            try await refreshCapabilitiesBody(using: greetingCapabilities)
 
             guard Self.establishPendingConnect(
                 pendingConnect,
@@ -391,16 +445,25 @@ final class IMAPConnection {
     }
 
     @discardableResult func fetchCapabilities() async throws -> [Capability] {
+        try await commandQueue.run { [self] in
+            try await self.fetchCapabilitiesBody()
+        }
+    }
+
+    @discardableResult
+    private func fetchCapabilitiesBody() async throws -> [Capability] {
         let command = CapabilityCommand()
-        let serverCapabilities = try await executeCommand(command)
+        let serverCapabilities = try await executeCommandBody(command)
         lifecycleState.withLockedValue { $0.capabilities = Set(serverCapabilities) }
         return serverCapabilities
     }
 
     func login(username: String, password: String) async throws {
-        let command = LoginCommand(username: username, password: password)
-        let loginCapabilities = try await executeCommand(command)
-        try await refreshCapabilities(using: loginCapabilities)
+        try await commandQueue.run { [self] in
+            let command = LoginCommand(username: username, password: password)
+            let loginCapabilities = try await self.executeCommandBody(command)
+            try await self.refreshCapabilitiesBody(using: loginCapabilities)
+        }
     }
 
     func authenticateXOAUTH2(email: String, accessToken: String) async throws {
@@ -700,24 +763,49 @@ final class IMAPConnection {
         return configuration
     }
 
-    private func refreshCapabilities(using reportedCapabilities: [Capability]) async throws {
+    /// Refreshes capabilities while the caller owns the command-queue lease.
+    private func refreshCapabilitiesBody(using reportedCapabilities: [Capability]) async throws {
         if !reportedCapabilities.isEmpty {
             lifecycleState.withLockedValue { $0.capabilities = Set(reportedCapabilities) }
         } else {
-            try await fetchCapabilities()
+            try await fetchCapabilitiesBody()
+        }
+    }
+
+    /// Awaits only the collector belonging to the adopted transport. Candidate
+    /// collectors are installed before their initializer/registration future
+    /// completes, so an early greeting is retained by its typed promise without
+    /// ever sharing state with another Happy-Eyeballs candidate.
+    private func awaitGreeting(
+        on transport: OwnedTransport,
+        timeoutSeconds: Int
+    ) async throws -> [Capability] {
+        let logger = self.logger
+        let handler = transport.greetingHandler
+        let scheduledTask = transport.channel.eventLoop.scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
+            logger.warning("Server greeting timed out after \(timeoutSeconds) seconds")
+            handler.failWithError(IMAPError.timeout)
+        }
+
+        do {
+            let capabilities = try await transport.greetingFuture.get()
+            scheduledTask.cancel()
+            transport.duplexLogger.flushInboundBuffer()
+            // A greeting received through channelRead removes itself. This
+            // explicit best-effort removal also covers timeout/close settlement.
+            try? await transport.channel.pipeline.removeHandler(handler).get()
+            return capabilities
+        } catch {
+            scheduledTask.cancel()
+            handler.failWithError(error)
+            try? await transport.channel.pipeline.removeHandler(handler).get()
+            transport.duplexLogger.flushInboundBuffer()
+            throw error
         }
     }
 
     private func authenticateXOAUTH2Body(email: String, accessToken: String) async throws {
         try ensureNotRetired()
-
-        let mechanism = AuthenticationMechanism("XOAUTH2")
-        let xoauthCapability = Capability.authenticate(mechanism)
-        let advertisedCapabilities = capabilitiesSnapshot
-
-        guard advertisedCapabilities.contains(xoauthCapability) else {
-            throw IMAPError.unsupportedAuthMechanism("XOAUTH2 not advertised by server")
-        }
 
         try await waitForIdleCompletionIfNeeded()
 
@@ -725,7 +813,7 @@ final class IMAPConnection {
 
         if currentTransport == nil {
             logger.info("Channel is nil, re-establishing connection before authentication")
-            try await connect()
+            try await connectBody()
         }
 
         guard let transport = currentTransport else {
@@ -734,6 +822,16 @@ final class IMAPConnection {
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
         let responseBuffer = transport.responseBuffer
+
+        // Automatic reconnect may have replaced the entire server generation
+        // and its advertised mechanisms. Never use the pre-reconnect capability
+        // snapshot to select XOAUTH2 or SASL-IR wire behavior.
+        let mechanism = AuthenticationMechanism("XOAUTH2")
+        let xoauthCapability = Capability.authenticate(mechanism)
+        let advertisedCapabilities = capabilitiesSnapshot
+        guard advertisedCapabilities.contains(xoauthCapability) else {
+            throw IMAPError.unsupportedAuthMechanism("XOAUTH2 not advertised by server")
+        }
 
         let expectsChallenge = !advertisedCapabilities.contains(.saslIR)
         let tag = generateCommandTag()
@@ -795,7 +893,7 @@ final class IMAPConnection {
             }
             duplexLogger.flushInboundBuffer()
 
-            try await refreshCapabilities(using: refreshedCapabilities)
+            try await refreshCapabilitiesBody(using: refreshedCapabilities)
         } catch {
             scheduledTask.cancel()
             responseBuffer.hasActiveHandler = false
@@ -931,7 +1029,7 @@ final class IMAPConnection {
 
         if currentTransport == nil {
             logger.info("Channel is nil, re-establishing connection before sending command")
-            try await connect()
+            try await connectBody()
         }
 
         guard let transport = currentTransport else {
@@ -956,58 +1054,6 @@ final class IMAPConnection {
             try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
             responseBuffer.hasActiveHandler = true
             try await command.send(on: channel, tag: tag)
-            let result = try await resultPromise.futureResult.get()
-
-            scheduledTask.cancel()
-            responseBuffer.hasActiveHandler = false
-
-            await handleConnectionTerminationInResponses(handler.untaggedResponses)
-            duplexLogger.flushInboundBuffer()
-
-            return result
-        } catch {
-            scheduledTask.cancel()
-            responseBuffer.hasActiveHandler = false
-            await handleConnectionTerminationInResponses(handler.untaggedResponses)
-            duplexLogger.flushInboundBuffer()
-
-            handler.failWithError(error)
-            try? await channel.pipeline.removeHandler(handler)
-            throw error
-        }
-    }
-
-    private func executeHandlerOnly<T: Sendable, HandlerType: IMAPCommandHandler>(
-        handlerType: HandlerType.Type,
-        timeoutSeconds: Int = 5
-    ) async throws -> T where HandlerType.ResultType == T {
-        try ensureNotRetired()
-        clearInvalidChannel()
-
-        if currentTransport == nil {
-            logger.info("Channel is nil, re-establishing connection before executing handler")
-            try await connect()
-        }
-
-        guard let transport = currentTransport else {
-            throw IMAPError.connectionFailed("Channel not initialized")
-        }
-        let channel = transport.channel
-        let duplexLogger = transport.duplexLogger
-        let responseBuffer = transport.responseBuffer
-
-        let resultPromise = channel.eventLoop.makePromise(of: T.self)
-        let handler = HandlerType.init(commandTag: "", promise: resultPromise)
-
-        let logger = self.logger
-        let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
-            logger.warning("Handler execution timed out after \(timeoutSeconds) seconds")
-            handler.failWithError(IMAPError.timeout)
-        }
-
-        do {
-            try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
-            responseBuffer.hasActiveHandler = true
             let result = try await resultPromise.futureResult.get()
 
             scheduledTask.cancel()
@@ -1106,6 +1152,7 @@ final class IMAPConnection {
                 if transport.claimLoggerInstallation() {
                     transport.loggerInstallationPromise.fail(ChannelError.ioOnClosedChannel)
                 }
+                transport.greetingHandler.failWithError(ChannelError.ioOnClosedChannel)
                 if transport.claimResponseBufferInstallation() {
                     transport.responseBufferInstallationPromise.fail(ChannelError.ioOnClosedChannel)
                 }
@@ -1135,12 +1182,15 @@ final class IMAPConnection {
                     Self.currentTeardownError(lifecycleState: lifecycleState)
                 )
             }
+            registration.transport.greetingHandler.failWithError(
+                Self.currentTeardownError(lifecycleState: lifecycleState)
+            )
             channel.close(mode: CloseMode.all, promise: nil)
         }
         return registration
     }
 
-    private static func installCandidateLoggerIfNeeded(
+    private static func installCandidatePipelineIfNeeded(
         _ registration: OwnedTransportRegistration
     ) -> EventLoopFuture<Void> {
         let transport = registration.transport
@@ -1149,9 +1199,16 @@ final class IMAPConnection {
         }
 
         if transport.claimLoggerInstallation() {
-            let installation = transport.channel.pipeline.addHandler(transport.duplexLogger)
+            // Both handlers must exist before the initializer/override future
+            // completes. Otherwise a fast server greeting can reach the tail
+            // before the adopted winner publishes its greeting authority.
+            let installation = transport.channel.pipeline.addHandlers([
+                transport.duplexLogger,
+                transport.greetingHandler
+            ])
             installation.cascade(to: transport.loggerInstallationPromise)
-            installation.whenFailure { _ in
+            installation.whenFailure { error in
+                transport.greetingHandler.failWithError(error)
                 transport.channel.close(mode: .all, promise: nil)
             }
         }
@@ -1356,6 +1413,27 @@ final class IMAPConnection {
         currentTransport?.responseBuffer.hasActiveHandler ?? false
     }
 
+    var pendingGreetingCount: Int {
+        lifecycleState.withLockedValue { state in
+            state.ownedTransports.values.reduce(into: 0) { count, transport in
+                if !transport.greetingHandler.isCompleted {
+                    count += 1
+                }
+            }
+        }
+    }
+
+    func hasInstalledGreetingHandler(on channel: Channel) async -> Bool {
+        (try? await channel.eventLoop.submit {
+            do {
+                _ = try channel.pipeline.syncOperations.context(handlerType: IMAPGreetingHandler.self)
+                return true
+            } catch {
+                return false
+            }
+        }.get()) ?? false
+    }
+
     func hasInstalledIdleHandler() async -> Bool {
         guard let channel = currentChannel else { return false }
         return (try? await channel.eventLoop.submit {
@@ -1384,6 +1462,12 @@ final class IMAPConnection {
             throw Self.abortedError
         }
 
+        // Prepared transports bypass the production greeting exchange. Settle
+        // and remove their candidate-owned collector explicitly so it cannot
+        // consume a later ordinary untagged OK or retain an unresolved promise.
+        registered.greetingHandler.succeedWithResult(Array(capabilities))
+        try? await channel.pipeline.removeHandler(registered.greetingHandler).get()
+
         try await Self.installResponseBufferIfNeeded(on: registered).get()
 
         let adopted = lifecycleState.withLockedValue { state -> Bool in
@@ -1405,7 +1489,7 @@ final class IMAPConnection {
         }
     }
 
-    /// Installs the exact per-candidate logger used by the production bootstrap
+    /// Installs the exact per-candidate logger and greeting collector used by the production bootstrap
     /// without adopting the channel. Internal for deterministic Happy-Eyeballs
     /// ownership tests and prepared-channel callers.
     @discardableResult
@@ -1416,7 +1500,7 @@ final class IMAPConnection {
             candidateResponseBufferFactory: candidateResponseBufferFactory,
             lifecycleState: lifecycleState
         )
-        try await Self.installCandidateLoggerIfNeeded(registration).get()
+        try await Self.installCandidatePipelineIfNeeded(registration).get()
         return registration.transport.duplexLogger
     }
 
