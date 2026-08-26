@@ -25,6 +25,14 @@ public enum IMAPError: Error {
     case unsupportedAuthMechanism(String)
 }
 
+extension IMAPError {
+    static let xoauth2AuthenticationFailureReason = "XOAUTH2 authentication was rejected"
+
+    static var xoauth2AuthenticationFailed: IMAPError {
+        .authFailed(xoauth2AuthenticationFailureReason)
+    }
+}
+
 // Add CustomStringConvertible conformance for better error messages
 extension IMAPError: CustomStringConvertible {
     public var description: String {

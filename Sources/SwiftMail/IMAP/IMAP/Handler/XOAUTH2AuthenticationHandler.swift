@@ -9,8 +9,6 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     private var collectedCapabilities: [Capability] = []
     private var shouldSendCredentialsOnChallenge: Bool
     private var credentials: ByteBuffer
-    private let serverLogger: Logger
-    private var lastServerError: String?
 
     init(
         commandTag: String,
@@ -19,9 +17,10 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
         expectsChallenge: Bool,
         logger: Logger
     ) {
-        self.credentials = credentials
+        // SASL-IR puts the initial response on the AUTHENTICATE command, so the
+        // handler must not retain a second credential buffer in that mode.
+        self.credentials = expectsChallenge ? credentials : ByteBuffer()
         self.shouldSendCredentialsOnChallenge = expectsChallenge
-        self.serverLogger = logger
         super.init(commandTag: commandTag, promise: promise)
     }
 
@@ -34,6 +33,11 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
 
         if case .authenticationChallenge(var challengeBuffer) = response {
             handleAuthenticationChallenge(&challengeBuffer, context: context)
+            // The base handler collects otherwise-unhandled responses. Do not
+            // pass a challenge through that path or its raw bytes would be
+            // retained in `untaggedResponses` for later inspection.
+            context.fireChannelRead(data)
+            return
         }
 
         super.channelRead(context: context, data: data)
@@ -58,13 +62,9 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
             return
         }
 
-        if let message = challenge.readString(length: challenge.readableBytes), !message.isEmpty {
-            lock.withLock { lastServerError = message }
-            serverLogger.error("XOAUTH2 server error: \(message)")
-        } else {
-            lock.withLock { lastServerError = nil }
-        }
-
+        // A post-credential challenge is server-controlled authentication data.
+        // Never decode, stringify, retain, or log it. XOAUTH2 requires an empty
+        // continuation response so that the server can send its tagged result.
         let emptyBuffer = context.channel.allocator.buffer(capacity: 0)
         context.channel
             .writeAndFlush(IMAPClientHandler.OutboundIn.part(.continuationResponse(emptyBuffer)))
@@ -72,8 +72,6 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     }
 
     override func handleTaggedOKResponse(_ response: TaggedResponse) {
-        super.handleTaggedOKResponse(response)
-
         let capabilities = lock.withLock { collectedCapabilities }
         if !capabilities.isEmpty {
             succeedWithResult(capabilities)
@@ -87,13 +85,9 @@ final class XOAUTH2AuthenticationHandler: BaseIMAPCommandHandler<[Capability]>, 
     }
 
     override func handleTaggedErrorResponse(_ response: TaggedResponse) {
-        let summary = String(describing: response.state)
-        let serverMessage = lock.withLock { lastServerError }
-        if let serverMessage, !serverMessage.isEmpty {
-            failWithError(IMAPError.authFailed("\(summary) (\(serverMessage))"))
-        } else {
-            failWithError(IMAPError.authFailed(summary))
-        }
+        // Tagged response text is server-controlled and can repeat challenge,
+        // account, scope, or credential material. Expose one fixed category.
+        failWithError(IMAPError.xoauth2AuthenticationFailed)
     }
 
     override func handleError(_ error: Error) {

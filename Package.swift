@@ -69,6 +69,8 @@ let package = Package(
                 .product(name: "Testing", package: "swift-testing"),
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "NIOIMAP", package: "swift-nio-imap"),
                 .product(name: "Logging", package: "swift-log")
             ],

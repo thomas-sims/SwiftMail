@@ -95,4 +95,8 @@ class MailLogger: ChannelDuplexHandler, @unchecked Sendable {
 	func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         fatalError("channelRead(context:data:) must be implemented by subclasses")
     }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        context.fireChannelInactive()
+    }
 } 

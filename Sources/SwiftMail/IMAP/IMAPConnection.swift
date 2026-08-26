@@ -9,6 +9,12 @@ import NIOSSL
 /// Internal connection wrapper used by IMAPServer to manage per-connection state.
 final class IMAPConnection {
     typealias ConnectOverride = (@escaping @Sendable (Channel) -> Void) -> EventLoopFuture<Channel>
+    typealias TLSHandlerFactory = @Sendable (NIOSSLContext, String?) throws -> ChannelHandler
+
+    struct ConnectionTarget: Equatable, Sendable {
+        let connectionHost: String
+        let tlsServerHostname: String?
+    }
 
     private final class PendingConnect: @unchecked Sendable {
         let id: UUID
@@ -101,6 +107,7 @@ final class IMAPConnection {
     private let port: Int
     private let group: EventLoopGroup
     private let connectOverride: ConnectOverride?
+    private let tlsHandlerFactory: TLSHandlerFactory
     private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
     private var capabilities: Set<NIOIMAPCore.Capability> = []
@@ -117,12 +124,16 @@ final class IMAPConnection {
         loggerLabel: String,
         outboundLabel: String,
         inboundLabel: String,
-        connectOverride: ConnectOverride? = nil
+        connectOverride: ConnectOverride? = nil,
+        tlsHandlerFactory: TLSHandlerFactory? = nil
     ) {
         self.host = host
         self.port = port
         self.group = group
         self.connectOverride = connectOverride
+        self.tlsHandlerFactory = tlsHandlerFactory ?? { context, serverHostname in
+            try NIOSSLClientHandler(context: context, serverHostname: serverHostname)
+        }
 
         self.logger = Logging.Logger(label: loggerLabel)
         let outboundLogger = Logging.Logger(label: outboundLabel)
@@ -147,8 +158,8 @@ final class IMAPConnection {
     func connect() async throws {
         try ensureNotRetired()
 
-        let sslContext = try NIOSSLContext(configuration: TLSConfiguration.makeClientConfiguration())
-        let host = self.host
+        let target = try Self.connectionTarget(for: host)
+        let sslContext = try NIOSSLContext(configuration: Self.makeTLSConfiguration())
 
         // Claim the single transport-creation slot before invoking ClientBootstrap
         // (or the deterministic test override). Otherwise abort or a second connect
@@ -191,6 +202,7 @@ final class IMAPConnection {
             connectFuture = connectOverride(registerChannel)
         } else {
             let duplexLogger = self.duplexLogger
+            let tlsHandlerFactory = self.tlsHandlerFactory
             connectFuture = ClientBootstrap(group: group)
                 // Make the NIO-owned Happy-Eyeballs attempt explicitly bounded.
                 // Hard abort additionally closes every candidate surfaced through
@@ -212,24 +224,30 @@ final class IMAPConnection {
                         }
                     }
 
-                    let sslHandler = try! NIOSSLClientHandler(context: sslContext, serverHostname: host)
+                    do {
+                        let sslHandler = try tlsHandlerFactory(sslContext, target.tlsServerHostname)
 
-                    let parserOptions = ResponseParser.Options(
-                        bufferLimit: 1024 * 1024,
-                        messageAttributeLimit: .max,
-                        bodySizeLimit: .max,
-                        literalSizeLimit: IMAPDefaults.literalSizeLimit
-                    )
+                        let parserOptions = ResponseParser.Options(
+                            bufferLimit: 1024 * 1024,
+                            messageAttributeLimit: .max,
+                            bodySizeLimit: .max,
+                            literalSizeLimit: IMAPDefaults.literalSizeLimit
+                        )
 
-                    try! channel.pipeline.syncOperations.addHandlers([
-                        sslHandler,
-                        IMAPClientHandler(parserOptions: parserOptions),
-                        duplexLogger
-                    ])
+                        try channel.pipeline.syncOperations.addHandlers([
+                            sslHandler,
+                            IMAPClientHandler(parserOptions: parserOptions),
+                            duplexLogger
+                        ])
 
-                    return channel.eventLoop.makeSucceededFuture(())
+                        return channel.eventLoop.makeSucceededFuture(())
+                    } catch {
+                        // Channel-initializer failures must fail the bootstrap future.
+                        // Never crash or fall back to plaintext/permissive TLS.
+                        return channel.eventLoop.makeFailedFuture(error)
+                    }
                 }
-                .connect(host: host, port: port)
+                .connect(host: target.connectionHost, port: port)
         }
 
         connectFuture.whenComplete { result in
@@ -586,6 +604,58 @@ final class IMAPConnection {
     }
 
     // MARK: - Private Helpers
+
+    static func connectionTarget(for host: String) throws -> ConnectionTarget {
+        // NIO's Darwin parser accepts scoped IPv6 spellings but its
+        // SocketAddress(ipAddress:) initializer does not preserve a scope ID.
+        // Reject them rather than silently connecting to a different interface.
+        guard !host.contains("%") else {
+            throw IMAPError.invalidArgument("Scoped IP literals are not supported as IMAP hosts")
+        }
+
+        if (try? SocketAddress(ipAddress: host, port: 0)) != nil {
+            return ConnectionTarget(connectionHost: host, tlsServerHostname: nil)
+        }
+
+        // ClientBootstrap expects a raw IPv6 address, while operators may enter
+        // the bracketed URI representation. Accept exactly one balanced pair
+        // only when its contents are a strict IPv6 literal, and normalize only
+        // the connection host. IPv4/DNS/scoped or malformed bracket forms are
+        // rejected instead of being misclassified as DNS/SNI names.
+        if host.contains("[") || host.contains("]") {
+            guard host.first == "[", host.last == "]" else {
+                throw IMAPError.invalidArgument("Invalid bracketed IMAP host")
+            }
+
+            let inner = String(host.dropFirst().dropLast())
+            guard !inner.contains("["), !inner.contains("]"),
+                  let address = try? SocketAddress(ipAddress: inner, port: 0),
+                  case .v6 = address else {
+                throw IMAPError.invalidArgument("Invalid bracketed IMAP host")
+            }
+
+            return ConnectionTarget(connectionHost: inner, tlsServerHostname: nil)
+        }
+
+        // A colon-bearing unbracketed value can only be an IPv6 literal in this
+        // API. If strict numeric parsing rejected it, fail locally rather than
+        // passing malformed input into DNS/TLS hostname handling.
+        guard !host.contains(":") else {
+            throw IMAPError.invalidArgument("Invalid unbracketed IMAP host")
+        }
+
+        // Classification is deliberately non-resolving. A value that is not a
+        // strict numeric literal remains a DNS name and retains SNI/hostname
+        // verification; it is never treated as an IP because it happens to
+        // resolve to one.
+        return ConnectionTarget(connectionHost: host, tlsServerHostname: host)
+    }
+
+    static func makeTLSConfiguration() -> TLSConfiguration {
+        var configuration = TLSConfiguration.makeClientConfiguration()
+        configuration.certificateVerification = .fullVerification
+        return configuration
+    }
 
     private func refreshCapabilities(using reportedCapabilities: [Capability]) async throws {
         if !reportedCapabilities.isEmpty {
