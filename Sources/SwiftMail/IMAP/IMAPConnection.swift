@@ -137,6 +137,46 @@ final class IMAPConnection {
         }
     }
 
+    /// Bridges Swift task cancellation into the synchronous NIO handler
+    /// completion boundary. A request made before handler installation is
+    /// replayed exactly once when the action becomes available.
+    private final class MutationCancellationControl: @unchecked Sendable {
+        private struct State {
+            var wasRequested = false
+            var action: (@Sendable () -> Void)?
+        }
+
+        private let state = NIOLockedValueBox(State())
+
+        func install(_ action: @escaping @Sendable () -> Void) {
+            let runImmediately = state.withLockedValue { state in
+                if state.wasRequested {
+                    return true
+                }
+                state.action = action
+                return false
+            }
+            if runImmediately {
+                action()
+            }
+        }
+
+        func request() {
+            let action = state.withLockedValue { state -> (@Sendable () -> Void)? in
+                guard !state.wasRequested else { return nil }
+                state.wasRequested = true
+                let action = state.action
+                state.action = nil
+                return action
+            }
+            action?()
+        }
+
+        func clear() {
+            state.withLockedValue { $0.action = nil }
+        }
+    }
+
     private struct OwnedTransportRegistration {
         let transport: OwnedTransport
         let wasInserted: Bool
@@ -1299,11 +1339,20 @@ final class IMAPConnection {
     private func executeCommandWithTransportBody<CommandType: IMAPCommand>(
         _ command: CommandType,
         reconnectIfNeeded: Bool = true,
-        requiredTransport: OwnedTransport? = nil
+        requiredTransport: OwnedTransport? = nil,
+        mutationTracker: MutationDispatchTracker? = nil,
+        cancellationControl: MutationCancellationControl? = nil
     ) async throws -> CommandExecution<CommandType.ResultType> {
+        defer { cancellationControl?.clear() }
+        if cancellationControl != nil {
+            try Task.checkCancellation()
+        }
         try ensureNotRetired()
         try command.validate()
         try await waitForIdleCompletionIfNeeded()
+        if cancellationControl != nil {
+            try Task.checkCancellation()
+        }
 
         clearInvalidChannel()
 
@@ -1313,6 +1362,9 @@ final class IMAPConnection {
             }
             logger.info("Channel is nil, re-establishing connection before sending command")
             try await connectBody()
+            if cancellationControl != nil {
+                try Task.checkCancellation()
+            }
         }
 
         guard let transport = currentTransport else {
@@ -1333,6 +1385,20 @@ final class IMAPConnection {
         let handler = CommandType.HandlerType.init(commandTag: tag, promise: resultPromise)
         let timeoutSeconds = command.timeoutSeconds
 
+        if let mutationTracker {
+            handler.installCompletionArbiter { isCancellation in
+                mutationTracker.acceptTerminal(isCancellation: isCancellation)
+            }
+        }
+        if let cancellationControl, let mutationTracker {
+            cancellationControl.install {
+                let cancellationWon = handler.failWithError(CancellationError())
+                if cancellationWon, mutationTracker.state != .notStarted {
+                    channel.close(mode: .all, promise: nil)
+                }
+            }
+        }
+
         let logger = self.logger
         let scheduledTask = group.next().scheduleTask(in: .seconds(Int64(timeoutSeconds))) {
             logger.warning("Command timed out after \(timeoutSeconds) seconds")
@@ -1342,6 +1408,9 @@ final class IMAPConnection {
         do {
             try await channel.pipeline.addHandler(handler, position: .before(responseBuffer)).get()
             responseBuffer.hasActiveHandler = true
+            if cancellationControl != nil {
+                try Task.checkCancellation()
+            }
             try await command.send(on: channel, tag: tag)
             let result = try await resultPromise.futureResult.get()
 
@@ -1360,6 +1429,14 @@ final class IMAPConnection {
 
             handler.failWithError(error)
             try? await channel.pipeline.removeHandler(handler)
+            if mutationTracker?.terminal == .cancelled,
+               mutationTracker?.state != .notStarted {
+                channel.close(mode: .all, promise: nil)
+                try? await channel.closeFuture.get()
+            }
+            if mutationTracker?.terminal == .cancelled {
+                throw CancellationError()
+            }
             throw error
         }
     }
@@ -1419,12 +1496,19 @@ final class IMAPConnection {
         phase: IMAPMutationFailure.Phase?,
         priorMutationMayHaveApplied: Bool
     ) async throws -> CommandType.ResultType {
+        let cancellationControl = MutationCancellationControl()
         do {
-            return try await executeCommandWithTransportBody(
-                command,
-                reconnectIfNeeded: false,
-                requiredTransport: transport
-            ).result
+            return try await withTaskCancellationHandler {
+                try await executeCommandWithTransportBody(
+                    command,
+                    reconnectIfNeeded: false,
+                    requiredTransport: transport,
+                    mutationTracker: command.dispatchTracker,
+                    cancellationControl: cancellationControl
+                ).result
+            } onCancel: {
+                cancellationControl.request()
+            }
         } catch let failure as IMAPMutationFailure {
             throw failure
         } catch {

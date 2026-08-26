@@ -24,15 +24,41 @@ final class MutationDispatchTracker: @unchecked Sendable {
         case writeCompleted
     }
 
+    enum Terminal: Equatable, Sendable {
+        case pending
+        case command
+        case cancelled
+    }
+
     private let lock = NIOLock()
     private var storedState: State = .notStarted
+    private var storedTerminal: Terminal = .pending
 
     var state: State {
         lock.withLock { storedState }
     }
 
-    func willWrite() {
-        lock.withLock { storedState = .writeAttempted }
+    var terminal: Terminal {
+        lock.withLock { storedTerminal }
+    }
+
+    /// Atomically assigns the first handler terminal. Command responses,
+    /// transport failures, and timeouts use `.command`; task cancellation uses
+    /// `.cancelled`.
+    func acceptTerminal(isCancellation: Bool) -> Bool {
+        lock.withLock {
+            guard storedTerminal == .pending else { return false }
+            storedTerminal = isCancellation ? .cancelled : .command
+            return true
+        }
+    }
+
+    func willWrite() -> Bool {
+        lock.withLock {
+            guard storedTerminal == .pending else { return false }
+            storedState = .writeAttempted
+            return true
+        }
     }
 
     func didWrite() {
@@ -52,7 +78,7 @@ extension IMAPMutationCommand {
     func send(on channel: Channel, tag: String) async throws {
         let taggedCommand = toTaggedCommand(tag: tag)
         let wrapped = IMAPClientHandler.OutboundIn.part(CommandStreamPart.tagged(taggedCommand))
-        dispatchTracker.willWrite()
+        guard dispatchTracker.willWrite() else { return }
         try await channel.writeAndFlush(wrapped).get()
         dispatchTracker.didWrite()
     }

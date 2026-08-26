@@ -23,4 +23,10 @@ protocol IMAPCommandHandler: ChannelInboundHandler, RemovableChannelHandler, Sen
     /// Fail the command if it has not already completed.
     @discardableResult
     func failWithError(_ error: Error) -> Bool
+
+    /// Install an exactly-once gate for tracked mutation terminals. The gate is
+    /// invoked while the handler owns its completion lock, before its promise is
+    /// resolved. Returning false leaves the handler unresolved because another
+    /// terminal already owns the command result.
+    func installCompletionArbiter(_ arbiter: @escaping @Sendable (_ isCancellation: Bool) -> Bool)
 }

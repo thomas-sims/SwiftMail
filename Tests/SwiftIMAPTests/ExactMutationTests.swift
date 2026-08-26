@@ -337,14 +337,150 @@ struct ExactMutationTests {
         await cleanup(preflight)
 
         let afterCopy = try await cancellationBoundary(afterPhase: 1)
-        #expect(afterCopy.failure.phase == .markDeleted)
+        #expect(afterCopy.failure.phase == .fallbackCopy)
         #expect(afterCopy.failure.certainty == .outcomeUnknown)
         #expect(afterCopy.commands.count == 1)
 
         let afterStore = try await cancellationBoundary(afterPhase: 2)
-        #expect(afterStore.failure.phase == .uidExpunge)
+        #expect(afterStore.failure.phase == .markDeleted)
         #expect(afterStore.failure.certainty == .outcomeUnknown)
         #expect(afterStore.commands.count == 2)
+    }
+
+    @Test
+    func cancellationWinsEveryDispatchedExactPhaseAndJoinsTransportClose() async throws {
+        for phase in TrackedCancellationPhase.allCases {
+            for lateTerminal in LateMutationTerminal.allCases {
+                let factoryCalls = LockedInt()
+                let fixture = try await makeConnectionFixture(
+                    capabilities: [.uidPlus],
+                    connectOverride: { _ -> EventLoopFuture<Channel> in
+                        factoryCalls.increment()
+                        return MultiThreadedEventLoopGroup.singleton.next().makeFailedFuture(
+                            IMAPConnectionError.disconnected
+                        )
+                    }
+                )
+                let closeGate = DeferredCloseHandler()
+                try await fixture.channel.pipeline.addHandler(closeGate, position: .first).get()
+
+                let operation = startTrackedMutation(phase, on: fixture.connection)
+                let advanced = try await advanceTrackedMutation(
+                    to: phase,
+                    operation: operation,
+                    on: fixture.channel
+                )
+                let currentCommand = advanced.current
+                #expect(advanced.commands.count == phase.expectedWriteCount)
+                #expect(phase.matches(currentCommand.command))
+                let completion = LockedBool()
+                let observed = Task {
+                    let result = await taskMutationFailure(operation)
+                    completion.setTrue()
+                    return result
+                }
+
+                let clock = ContinuousClock()
+                let cancellationStart = clock.now
+                operation.cancel()
+                try await waitForCloseRequest(closeGate, clock: clock)
+
+                switch lateTerminal {
+                case .ok:
+                    try await respondOK(to: currentCommand, on: fixture.channel)
+                case .no:
+                    try await respondNO(
+                        to: currentCommand,
+                        text: "late-terminal-marker",
+                        on: fixture.channel
+                    )
+                case .none:
+                    break
+                }
+
+                try await Task.sleep(for: .milliseconds(10))
+                #expect(!completion.value, "The mutation lease escaped before exact transport close")
+                closeGate.release()
+
+                let failure = try #require(await observed.value)
+                let elapsed = cancellationStart.duration(to: clock.now)
+                #expect(elapsed < .milliseconds(250))
+                #expect(failure.operation == phase.operation)
+                #expect(failure.phase == phase.failurePhase)
+                #expect(failure.certainty == .outcomeUnknown)
+                #expect(failure.reason == .cancelled)
+                #expect(!String(describing: failure).contains("late-terminal-marker"))
+                #expect(factoryCalls.value == 0)
+                #expect(try await fixture.channel.readOutbound(as: IMAPClientHandler.OutboundIn.self) == nil)
+                await cleanup(fixture)
+            }
+        }
+    }
+
+    @Test
+    func taggedTerminalWinsBeforeLaterCancellation() async throws {
+        for phase in TrackedCancellationPhase.allCases {
+            let fixture = try await makeConnectionFixture(capabilities: [.uidPlus])
+            let operation = startTrackedMutation(phase, on: fixture.connection)
+            let advanced = try await advanceTrackedMutation(
+                to: phase,
+                operation: operation,
+                on: fixture.channel
+            )
+            let currentCommand = advanced.current
+            #expect(advanced.commands.count == phase.expectedWriteCount)
+            #expect(phase.matches(currentCommand.command))
+            try await respondNO(
+                to: currentCommand,
+                text: "terminal-first-marker",
+                on: fixture.channel
+            )
+            operation.cancel()
+
+            let failure = try #require(await taskMutationFailure(operation))
+            #expect(failure.operation == phase.operation)
+            #expect(failure.phase == phase.failurePhase)
+            #expect(failure.certainty == .outcomeUnknown)
+            #expect(failure.reason == .serverRejected)
+            #expect(!String(describing: failure).contains("terminal-first-marker"))
+            #expect(try await fixture.channel.readOutbound(as: IMAPClientHandler.OutboundIn.self) == nil)
+            await cleanup(fixture)
+        }
+
+        for phase in [TrackedCancellationPhase.uidExpunge,
+                      .permanentDeleteExpunge,
+                      .fallbackExpunge] {
+            let fixture = try await makeConnectionFixture(capabilities: [.uidPlus])
+            let operation = startTrackedMutation(phase, on: fixture.connection)
+            let advanced = try await advanceTrackedMutation(
+                to: phase,
+                operation: operation,
+                on: fixture.channel
+            )
+            let currentCommand = advanced.current
+            #expect(advanced.commands.count == phase.expectedWriteCount)
+            #expect(phase.matches(currentCommand.command))
+            try await respondOK(to: currentCommand, on: fixture.channel)
+            operation.cancel()
+            try await operation.value
+            #expect(try await fixture.channel.readOutbound(as: IMAPClientHandler.OutboundIn.self) == nil)
+            await cleanup(fixture)
+        }
+    }
+
+    @Test
+    func anEarlierTerminalPreventsTrackedCommandDispatch() async throws {
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let command = UIDExpungeCommand(identifierSet: UIDSet(UID(91)))
+        #expect(command.dispatchTracker.acceptTerminal(isCancellation: false))
+
+        try await command.send(on: channel, tag: "A1")
+
+        #expect(command.dispatchTracker.state == .notStarted)
+        #expect(try await channel.readOutbound(as: IMAPClientHandler.OutboundIn.self) == nil)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
     }
 
     @Test
@@ -420,6 +556,68 @@ struct ExactMutationTests {
     }
 }
 
+private enum TrackedCancellationPhase: CaseIterable {
+    case uidExpunge
+    case permanentDeleteStore
+    case permanentDeleteExpunge
+    case fallbackCopy
+    case fallbackStore
+    case fallbackExpunge
+
+    var operation: IMAPMutationFailure.Operation {
+        switch self {
+        case .uidExpunge:
+            return .uidExpunge
+        case .permanentDeleteStore, .permanentDeleteExpunge:
+            return .permanentDelete
+        case .fallbackCopy, .fallbackStore, .fallbackExpunge:
+            return .move
+        }
+    }
+
+    var failurePhase: IMAPMutationFailure.Phase {
+        switch self {
+        case .uidExpunge, .permanentDeleteExpunge, .fallbackExpunge:
+            return .uidExpunge
+        case .permanentDeleteStore, .fallbackStore:
+            return .markDeleted
+        case .fallbackCopy:
+            return .fallbackCopy
+        }
+    }
+
+    var expectedWriteCount: Int {
+        switch self {
+        case .uidExpunge, .permanentDeleteStore, .fallbackCopy:
+            return 1
+        case .permanentDeleteExpunge, .fallbackStore:
+            return 2
+        case .fallbackExpunge:
+            return 3
+        }
+    }
+
+    func matches(_ command: Command) -> Bool {
+        switch (self, command) {
+        case (.uidExpunge, .uidExpunge(_)),
+             (.permanentDeleteStore, .uidStore(_, _, _)),
+             (.permanentDeleteExpunge, .uidExpunge(_)),
+             (.fallbackCopy, .uidCopy(_, _)),
+             (.fallbackStore, .uidStore(_, _, _)),
+             (.fallbackExpunge, .uidExpunge(_)):
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+private enum LateMutationTerminal: CaseIterable {
+    case ok
+    case no
+    case none
+}
+
 private enum ExactFailureMode: CaseIterable, Equatable {
     case taggedFailure
     case timeout
@@ -480,6 +678,101 @@ private func makeConnectionFixture(
     )
     try await connection.prepareEstablishedChannel(channel, capabilities: capabilities)
     return ConnectionFixture(connection: connection, channel: channel, group: group)
+}
+
+private func startTrackedMutation(
+    _ phase: TrackedCancellationPhase,
+    on connection: IMAPConnection
+) -> Task<Void, Error> {
+    Task {
+        switch phase {
+        case .uidExpunge:
+            try await connection.executeUIDExpunge(messages: UIDSet(UID(81)))
+        case .permanentDeleteStore, .permanentDeleteExpunge:
+            try await connection.executePermanentDelete(message: UID(82))
+        case .fallbackCopy, .fallbackStore, .fallbackExpunge:
+            _ = try await connection.executeMoveWithFallback(
+                messages: UIDSet(UID(83)),
+                to: "Archive"
+            )
+        }
+    }
+}
+
+private struct AdvancedTrackedMutation {
+    let current: TaggedCommand
+    let commands: [TaggedCommand]
+}
+
+private func advanceTrackedMutation(
+    to phase: TrackedCancellationPhase,
+    operation: Task<Void, Error>,
+    on channel: NIOAsyncTestingChannel
+) async throws -> AdvancedTrackedMutation {
+    _ = operation
+    var commands: [TaggedCommand] = []
+    switch phase {
+    case .uidExpunge, .permanentDeleteStore, .fallbackCopy:
+        let current = try await nextExactTaggedCommand(on: channel)
+        commands.append(current)
+        return AdvancedTrackedMutation(current: current, commands: commands)
+
+    case .permanentDeleteExpunge:
+        let store = try await nextExactTaggedCommand(on: channel)
+        commands.append(store)
+        try await respondOK(to: store, on: channel)
+        let current = try await nextExactTaggedCommand(on: channel)
+        commands.append(current)
+        return AdvancedTrackedMutation(current: current, commands: commands)
+
+    case .fallbackStore:
+        let copy = try await nextExactTaggedCommand(on: channel)
+        commands.append(copy)
+        try await respondOK(
+            to: copy,
+            code: makeExactCOPYUID(
+                validity: 7,
+                source: [(83, 83)],
+                destination: [(183, 183)]
+            ),
+            on: channel
+        )
+        let current = try await nextExactTaggedCommand(on: channel)
+        commands.append(current)
+        return AdvancedTrackedMutation(current: current, commands: commands)
+
+    case .fallbackExpunge:
+        let copy = try await nextExactTaggedCommand(on: channel)
+        commands.append(copy)
+        try await respondOK(
+            to: copy,
+            code: makeExactCOPYUID(
+                validity: 7,
+                source: [(83, 83)],
+                destination: [(183, 183)]
+            ),
+            on: channel
+        )
+        let store = try await nextExactTaggedCommand(on: channel)
+        commands.append(store)
+        try await respondOK(to: store, on: channel)
+        let current = try await nextExactTaggedCommand(on: channel)
+        commands.append(current)
+        return AdvancedTrackedMutation(current: current, commands: commands)
+    }
+}
+
+private func waitForCloseRequest(
+    _ gate: DeferredCloseHandler,
+    clock: ContinuousClock
+) async throws {
+    let start = clock.now
+    while !gate.closeRequested {
+        guard start.duration(to: clock.now) < .milliseconds(100) else {
+            throw IMAPError.timeout
+        }
+        try await Task.sleep(for: .milliseconds(1))
+    }
 }
 
 private func cleanup(_ fixture: ServerFixture) async {
@@ -703,5 +996,82 @@ private final class LockedInt: @unchecked Sendable {
         lock.lock()
         storedValue += 1
         lock.unlock()
+    }
+}
+
+private final class LockedBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func setTrue() {
+        lock.lock()
+        storedValue = true
+        lock.unlock()
+    }
+}
+
+private final class DeferredCloseHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = IMAPClientHandler.OutboundIn
+
+    private struct PendingClose: @unchecked Sendable {
+        let context: ChannelHandlerContext
+        let mode: CloseMode
+        let promise: EventLoopPromise<Void>?
+    }
+
+    private let lock = NSLock()
+    private var requested = false
+    private var released = false
+    private var pending: [PendingClose] = []
+
+    var closeRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return requested
+    }
+
+    func close(
+        context: ChannelHandlerContext,
+        mode: CloseMode,
+        promise: EventLoopPromise<Void>?
+    ) {
+        lock.lock()
+        if released {
+            lock.unlock()
+            context.close(mode: mode, promise: promise)
+            return
+        }
+        requested = true
+        pending.append(PendingClose(context: context, mode: mode, promise: promise))
+        lock.unlock()
+    }
+
+    func release() {
+        lock.lock()
+        guard !released else {
+            lock.unlock()
+            return
+        }
+        released = true
+        let pending = self.pending
+        self.pending = []
+        lock.unlock()
+
+        guard let first = pending.first else { return }
+        first.context.eventLoop.execute {
+            let joined = first.context.eventLoop.makePromise(of: Void.self)
+            joined.futureResult.whenComplete { result in
+                for request in pending {
+                    request.promise?.completeWith(result)
+                }
+            }
+            first.context.close(mode: first.mode, promise: joined)
+        }
     }
 }

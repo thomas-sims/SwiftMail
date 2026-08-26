@@ -33,6 +33,10 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
     /// Whether this handler has completed processing
     private var _isCompleted: Bool = false
 
+    /// Optional first-terminal gate used only by tracked mutation execution.
+    /// It is installed before the handler can observe a response or error.
+    private var completionArbiter: (@Sendable (_ isCancellation: Bool) -> Bool)?
+
     var isCompleted: Bool {
         lock.withLock { _isCompleted }
     }
@@ -94,6 +98,15 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
     @discardableResult
     func failWithError(_ error: Error) -> Bool {
         completePromise(with: .failure(error))
+    }
+
+    func installCompletionArbiter(
+        _ arbiter: @escaping @Sendable (_ isCancellation: Bool) -> Bool
+    ) {
+        lock.withLock {
+            precondition(!_isCompleted, "Completion arbiter must be installed before command execution")
+            completionArbiter = arbiter
+        }
     }
     
     /// Process an incoming response
@@ -231,6 +244,14 @@ class BaseIMAPCommandHandler<ResultType: Sendable>: CommandHandler, RemovableCha
     private func completePromise(with result: Result<ResultType, Error>) -> Bool {
         let shouldComplete = lock.withLock {
             guard !_isCompleted else { return false }
+            let isCancellation: Bool
+            switch result {
+            case .failure(let error):
+                isCancellation = error is CancellationError
+            case .success:
+                isCancellation = false
+            }
+            guard completionArbiter?(isCancellation) ?? true else { return false }
             _isCompleted = true
             return true
         }
