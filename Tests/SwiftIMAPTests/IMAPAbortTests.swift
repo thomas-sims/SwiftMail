@@ -476,8 +476,9 @@ struct IMAPAbortTests {
                 inboundLabel: "test.imap.in",
                 connectOverride: { registerChannel in
                     group.next().scheduleTask(in: .milliseconds(10)) {
-                        registerChannel(channel)
-                        transportPromise.succeed(channel)
+                        registerChannel(channel).whenComplete { _ in
+                            transportPromise.succeed(channel)
+                        }
                     }
                     return transportPromise.futureResult
                 }
@@ -529,8 +530,9 @@ struct IMAPAbortTests {
                 connectOverride: { registerChannel in
                     factoryCalls.increment()
                     releaseFactory.wait()
-                    registerChannel(channel)
-                    transportPromise.succeed(channel)
+                    registerChannel(channel).whenComplete { _ in
+                        transportPromise.succeed(channel)
+                    }
                     return transportPromise.futureResult
                 }
             )
@@ -824,8 +826,7 @@ struct IMAPAbortTests {
             inboundLabel: "test.imap.in",
             connectOverride: { registerChannel in
                 factoryCalls.increment()
-                registerChannel(channel)
-                return channel.eventLoop.makeSucceededFuture(channel)
+                return registerChannel(channel).map { channel }
             }
         )
 
@@ -913,13 +914,13 @@ struct IMAPAbortTests {
                 let call = factoryCalls.incrementAndGet()
                 if call == 1 {
                     releaseFirstFactory.wait()
-                    registerChannel(firstChannel)
-                    firstTransportPromise.succeed(firstChannel)
+                    registerChannel(firstChannel).whenComplete { _ in
+                        firstTransportPromise.succeed(firstChannel)
+                    }
                     return firstTransportPromise.futureResult
                 }
 
-                registerChannel(secondChannel)
-                return secondChannel.eventLoop.makeSucceededFuture(secondChannel)
+                return registerChannel(secondChannel).map { secondChannel }
             }
         )
 

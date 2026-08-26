@@ -669,6 +669,327 @@ struct XOAUTH2SecurityTests {
         #expect(!capture.joinedMessages.contains("current-generation-terminal-sentinel"))
         #expect(!capture.joinedMessages.contains("reconnect-auth-terminal-sentinel"))
     }
+
+    @Test
+    func adoptedCandidateOwnsAuthenticationAndOrdinaryLoggingInBothInitializationOrders() async throws {
+        for order in CandidateInitializationOrder.allCases {
+            try await verifyAdoptedCandidateLoggerAuthority(order: order)
+        }
+    }
+
+    @Test
+    func connectOverridePublishesOnlyAdoptedCandidateLoggerInBothOrders() async throws {
+        for order in CandidateInitializationOrder.allCases {
+            try await verifyConnectOverrideCandidateLoggerAuthority(order: order)
+        }
+    }
+
+    @Test
+    func candidateLoggerAuthorityRemainsBoundedAcrossRepeatedReconnects() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let registry = CandidateLoggerRegistry()
+        let connection = makeCandidateLoggerConnection(group: group, registry: registry)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+
+        for index in 0..<32 {
+            let eventLoop = NIOAsyncTestingEventLoop()
+            let winner = NIOAsyncTestingChannel(loop: eventLoop)
+            let loser = NIOAsyncTestingChannel(loop: eventLoop)
+            try await winner.connect(to: address).get()
+            try await loser.connect(to: address).get()
+
+            if index.isMultiple(of: 2) {
+                _ = try await connection.prepareCandidateChannel(loser)
+                let preparedWinner = try await connection.prepareCandidateChannel(winner)
+                try await connection.prepareEstablishedChannel(
+                    winner,
+                    capabilities: candidateAuthenticationCapabilities
+                )
+                #expect(registry.logger(for: winner) === preparedWinner)
+            } else {
+                let preparedWinner = try await connection.prepareCandidateChannel(winner)
+                try await connection.prepareEstablishedChannel(
+                    winner,
+                    capabilities: candidateAuthenticationCapabilities
+                )
+                #expect(registry.logger(for: winner) === preparedWinner)
+            }
+
+            let winnerLogger = try #require(registry.logger(for: winner))
+            let auth = Task {
+                try await connection.authenticateXOAUTH2(
+                    email: "fixture@example.invalid",
+                    accessToken: "fixture-access-token"
+                )
+            }
+            let authCommand = try await nextTaggedCommand(on: winner)
+            try await waitForCandidateCondition { winnerLogger.isAuthenticationRedactionActive }
+
+            if !index.isMultiple(of: 2) {
+                _ = try await connection.prepareCandidateChannel(loser)
+            }
+            let loserLogger = try #require(registry.logger(for: loser))
+            #expect(winnerLogger !== loserLogger)
+            #expect(winnerLogger.isAuthenticationRedactionActive)
+            #expect(!loserLogger.isAuthenticationRedactionActive)
+            #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+            #expect(loserLogger.authenticationSensitiveTagCount == 0)
+
+            try await loser.close().get()
+            #expect(winnerLogger.isAuthenticationRedactionActive)
+            #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+            #expect(loserLogger.authenticationSensitiveTagCount == 0)
+
+            _ = try await winner.writeInbound(authenticationSuccess(tag: authCommand.tag))
+            _ = try? await winner.readInbound(as: Response.self)
+            try await auth.value
+
+            try await connection.disconnect()
+            #expect(connection.ownedTransportCount == 0)
+            #expect(winnerLogger.authenticationSensitiveTagCount == 0)
+            #expect(loserLogger.authenticationSensitiveTagCount == 0)
+            #expect(!winner.isActive)
+            #expect(!loser.isActive)
+
+            _ = try? await loser.finish(acceptAlreadyClosed: true)
+            _ = try? await winner.finish(acceptAlreadyClosed: true)
+        }
+
+        #expect(registry.creationCount == 64)
+        try await group.shutdownGracefully()
+    }
+}
+
+private enum CandidateInitializationOrder: CaseIterable, Sendable {
+    case loserBeforeWinner
+    case winnerBeforeLateLoser
+}
+
+private let candidateAuthenticationCapabilities: Set<Capability> = [
+    .imap4rev1,
+    .authenticate(AuthenticationMechanism("XOAUTH2")),
+    .saslIR,
+]
+
+private func verifyConnectOverrideCandidateLoggerAuthority(
+    order: CandidateInitializationOrder
+) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = NIOAsyncTestingEventLoop()
+    let winner = NIOAsyncTestingChannel(loop: eventLoop)
+    let loser = NIOAsyncTestingChannel(loop: eventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await winner.connect(to: address).get()
+    try await loser.connect(to: address).get()
+
+    let registry = CandidateLoggerRegistry()
+    let connection = IMAPConnection(
+        host: "invalid.invalid",
+        port: 993,
+        group: group,
+        loggerLabel: "test.imap.candidate.connect",
+        outboundLabel: "test.imap.candidate.connect.out",
+        inboundLabel: "test.imap.candidate.connect.in",
+        connectOverride: { registerChannel in
+            let registrations: EventLoopFuture<Void>
+            switch order {
+            case .loserBeforeWinner:
+                registrations = registerChannel(loser).flatMap { registerChannel(winner) }
+            case .winnerBeforeLateLoser:
+                registrations = registerChannel(winner).flatMap { registerChannel(loser) }
+            }
+            return registrations.map { winner }
+        },
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) }
+    )
+
+    let connect = Task { try await connection.connect() }
+    try await waitForCandidateCondition {
+        connection.isConnected && connection.hasActiveResponseHandler
+    }
+    _ = try await winner.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+        code: .capability(Array(candidateAuthenticationCapabilities)),
+        text: "candidate-ready"
+    )))))
+    _ = try? await winner.readInbound(as: Response.self)
+    try await connect.value
+
+    let winnerLogger = try #require(registry.logger(for: winner))
+    let loserLogger = try #require(registry.logger(for: loser))
+    #expect(registry.entryCount == 2)
+    #expect(winnerLogger !== loserLogger)
+
+    let auth = Task {
+        try await connection.authenticateXOAUTH2(
+            email: "fixture@example.invalid",
+            accessToken: "fixture-access-token"
+        )
+    }
+    let authCommand = try await nextTaggedCommand(on: winner)
+    try await waitForCandidateCondition { winnerLogger.isAuthenticationRedactionActive }
+    #expect(!loserLogger.isAuthenticationRedactionActive)
+
+    // A losing candidate may close after the winner has been adopted and AUTH
+    // has begun. Its callbacks must remain local to its own logger instance.
+    try await loser.close().get()
+    #expect(winnerLogger.isAuthenticationRedactionActive)
+    #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+    #expect(loserLogger.authenticationSensitiveTagCount == 0)
+
+    _ = try await winner.writeInbound(authenticationSuccess(tag: authCommand.tag))
+    _ = try? await winner.readInbound(as: Response.self)
+    try await auth.value
+
+    try await connection.disconnect()
+    #expect(connection.ownedTransportCount == 0)
+    #expect(winnerLogger.authenticationSensitiveTagCount == 0)
+    #expect(loserLogger.authenticationSensitiveTagCount == 0)
+    _ = try? await loser.finish(acceptAlreadyClosed: true)
+    _ = try? await winner.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
+
+private func verifyAdoptedCandidateLoggerAuthority(
+    order: CandidateInitializationOrder
+) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = NIOAsyncTestingEventLoop()
+    let winner = NIOAsyncTestingChannel(loop: eventLoop)
+    let loser = NIOAsyncTestingChannel(loop: eventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await winner.connect(to: address).get()
+    try await loser.connect(to: address).get()
+
+    let registry = CandidateLoggerRegistry()
+    let connection = makeCandidateLoggerConnection(group: group, registry: registry)
+
+    switch order {
+    case .loserBeforeWinner:
+        _ = try await connection.prepareCandidateChannel(loser)
+        let preparedWinner = try await connection.prepareCandidateChannel(winner)
+        try await connection.prepareEstablishedChannel(
+            winner,
+            capabilities: candidateAuthenticationCapabilities
+        )
+        #expect(registry.logger(for: winner) === preparedWinner)
+    case .winnerBeforeLateLoser:
+        let preparedWinner = try await connection.prepareCandidateChannel(winner)
+        try await connection.prepareEstablishedChannel(
+            winner,
+            capabilities: candidateAuthenticationCapabilities
+        )
+        #expect(registry.logger(for: winner) === preparedWinner)
+    }
+
+    let winnerLogger = try #require(registry.logger(for: winner))
+    let winnerCapture = try #require(registry.capture(for: winner))
+    let auth = Task {
+        try await connection.authenticateXOAUTH2(
+            email: "fixture@example.invalid",
+            accessToken: "fixture-access-token"
+        )
+    }
+    let authCommand = try await nextTaggedCommand(on: winner)
+    try await waitForCandidateCondition { winnerLogger.isAuthenticationRedactionActive }
+
+    if order == .winnerBeforeLateLoser {
+        _ = try await connection.prepareCandidateChannel(loser)
+    }
+    let loserLogger = try #require(registry.logger(for: loser))
+    let loserCapture = try #require(registry.capture(for: loser))
+    #expect(registry.entryCount == 2)
+    #expect(winnerLogger !== loserLogger)
+    #expect(winnerLogger.isAuthenticationRedactionActive)
+    #expect(!loserLogger.isAuthenticationRedactionActive)
+    #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+    #expect(loserLogger.authenticationSensitiveTagCount == 0)
+
+    if order == .winnerBeforeLateLoser {
+        // The exact reproduced order: winner AUTH is live before a losing
+        // candidate's handlerAdded/inactive/removed callbacks run.
+        try await loser.close().get()
+        #expect(winnerLogger.isAuthenticationRedactionActive)
+        #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+    }
+
+    _ = try await winner.writeInbound(authenticationSuccess(tag: authCommand.tag))
+    _ = try? await winner.readInbound(as: Response.self)
+    try await auth.value
+    #expect(!winnerCapture.joinedMessages.contains("candidate-auth-terminal-sentinel"))
+
+    if order == .loserBeforeWinner {
+        try await loser.close().get()
+    }
+    #expect(winnerLogger.authenticationSensitiveTagCount == 1)
+    #expect(loserLogger.authenticationSensitiveTagCount == 0)
+
+    let ordinary = Task { try await connection.noop() }
+    let ordinaryCommand = try await nextTaggedCommand(on: winner)
+    _ = try await winner.writeInbound(Response.tagged(.init(
+        tag: ordinaryCommand.tag,
+        state: .ok(.init(text: "winner-ordinary-response-sentinel"))
+    )))
+    _ = try? await winner.readInbound(as: Response.self)
+    _ = try await ordinary.value
+
+    #expect(winnerCapture.joinedMessages.contains("winner-ordinary-response-sentinel"))
+    #expect(!loserCapture.joinedMessages.contains("winner-ordinary-response-sentinel"))
+    #expect(!loserCapture.joinedMessages.contains("candidate-auth-terminal-sentinel"))
+
+    try await connection.disconnect()
+    #expect(connection.ownedTransportCount == 0)
+    #expect(winnerLogger.authenticationSensitiveTagCount == 0)
+    #expect(loserLogger.authenticationSensitiveTagCount == 0)
+    _ = try? await loser.finish(acceptAlreadyClosed: true)
+    _ = try? await winner.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
+
+private func makeCandidateLoggerConnection(
+    group: EventLoopGroup,
+    registry: CandidateLoggerRegistry
+) -> IMAPConnection {
+    IMAPConnection(
+        host: "invalid.invalid",
+        port: 993,
+        group: group,
+        loggerLabel: "test.imap.candidate.connection",
+        outboundLabel: "test.imap.candidate.out",
+        inboundLabel: "test.imap.candidate.in",
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) }
+    )
+}
+
+private func nextTaggedCommand(on channel: NIOAsyncTestingChannel) async throws -> TaggedCommand {
+    let outbound = try await channel.waitForOutboundWrite(as: IMAPClientHandler.OutboundIn.self)
+    guard case .part(.tagged(let command)) = outbound else {
+        Issue.record("Expected a tagged candidate-channel command")
+        throw IMAPError.commandFailed("Expected tagged test command")
+    }
+    return command
+}
+
+private func authenticationSuccess(tag: String) -> Response {
+    .tagged(.init(
+        tag: tag,
+        state: .ok(.init(
+            code: .capability(Array(candidateAuthenticationCapabilities)),
+            text: "candidate-auth-terminal-sentinel"
+        ))
+    ))
+}
+
+private func waitForCandidateCondition(
+    timeoutNanoseconds: UInt64 = 2_000_000_000,
+    condition: () -> Bool
+) async throws {
+    let deadline = ContinuousClock().now.advanced(by: .nanoseconds(Int64(timeoutNanoseconds)))
+    while !condition() {
+        if ContinuousClock().now >= deadline {
+            throw IMAPError.timeout
+        }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
 }
 
 private enum AuthenticationChallengeFixture {
@@ -959,6 +1280,44 @@ private final class LogCapture: @unchecked Sendable {
         lock.lock()
         messages.append(message)
         lock.unlock()
+    }
+}
+
+private final class CandidateLoggerRegistry: @unchecked Sendable {
+    private struct Entry {
+        let logger: IMAPLogger
+        let capture: LogCapture
+    }
+
+    private let lock = NSLock()
+    private var entries: [ObjectIdentifier: Entry] = [:]
+    private var storedCreationCount = 0
+
+    var entryCount: Int {
+        lock.withLock { entries.count }
+    }
+
+    var creationCount: Int {
+        lock.withLock { storedCreationCount }
+    }
+
+    func makeLogger(for channel: Channel) -> IMAPLogger {
+        let capture = LogCapture()
+        let logger = makeCaptureLogger(label: "test.imap.candidate.transport", capture: capture)
+        let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
+        lock.withLock {
+            storedCreationCount += 1
+            entries[ObjectIdentifier(channel)] = Entry(logger: imapLogger, capture: capture)
+        }
+        return imapLogger
+    }
+
+    func logger(for channel: Channel) -> IMAPLogger? {
+        lock.withLock { entries[ObjectIdentifier(channel)]?.logger }
+    }
+
+    func capture(for channel: Channel) -> LogCapture? {
+        lock.withLock { entries[ObjectIdentifier(channel)]?.capture }
     }
 }
 

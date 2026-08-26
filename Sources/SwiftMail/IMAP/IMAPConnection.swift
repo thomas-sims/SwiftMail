@@ -8,8 +8,9 @@ import NIOSSL
 
 /// Internal connection wrapper used by IMAPServer to manage per-connection state.
 final class IMAPConnection {
-    typealias ConnectOverride = (@escaping @Sendable (Channel) -> Void) -> EventLoopFuture<Channel>
+    typealias ConnectOverride = (@escaping @Sendable (Channel) -> EventLoopFuture<Void>) -> EventLoopFuture<Channel>
     typealias TLSHandlerFactory = @Sendable (NIOSSLContext, String?) throws -> ChannelHandler
+    typealias CandidateLoggerFactory = @Sendable (Channel) -> IMAPLogger
 
     struct ConnectionTarget: Equatable, Sendable {
         let connectionHost: String
@@ -87,12 +88,24 @@ final class IMAPConnection {
         }
     }
 
+    private struct OwnedTransport {
+        let channel: Channel
+        let duplexLogger: IMAPLogger
+    }
+
+    private struct OwnedTransportRegistration {
+        let duplexLogger: IMAPLogger
+        let wasInserted: Bool
+    }
+
     private struct LifecycleState {
-        var channel: Channel?
+        /// Channel and logger authority are adopted atomically. A logger from a
+        /// losing Happy-Eyeballs candidate can never become the command logger.
+        var adoptedTransport: OwnedTransport?
         /// Every channel created for this connection, including Happy-Eyeballs
         /// candidates that have not won yet and channels that are closing.
         /// Entries are removed only by their `closeFuture` callback.
-        var ownedChannels: [ObjectIdentifier: Channel] = [:]
+        var ownedTransports: [ObjectIdentifier: OwnedTransport] = [:]
         var pendingConnect: PendingConnect?
         var isRetired = false
         /// A recoverable generation fence. Unlike `isRetired`, this is cleared
@@ -108,6 +121,7 @@ final class IMAPConnection {
     private let group: EventLoopGroup
     private let connectOverride: ConnectOverride?
     private let tlsHandlerFactory: TLSHandlerFactory
+    private let candidateLoggerFactory: CandidateLoggerFactory
     private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
     private var capabilities: Set<NIOIMAPCore.Capability> = []
@@ -115,7 +129,6 @@ final class IMAPConnection {
     private let responseBuffer = UntaggedResponseBuffer()
 
     private let logger: Logging.Logger
-    private let duplexLogger: IMAPLogger
 
     init(
         host: String,
@@ -125,7 +138,8 @@ final class IMAPConnection {
         outboundLabel: String,
         inboundLabel: String,
         connectOverride: ConnectOverride? = nil,
-        tlsHandlerFactory: TLSHandlerFactory? = nil
+        tlsHandlerFactory: TLSHandlerFactory? = nil,
+        candidateLoggerFactory: CandidateLoggerFactory? = nil
     ) {
         self.host = host
         self.port = port
@@ -134,16 +148,19 @@ final class IMAPConnection {
         self.tlsHandlerFactory = tlsHandlerFactory ?? { context, serverHostname in
             try NIOSSLClientHandler(context: context, serverHostname: serverHostname)
         }
+        self.candidateLoggerFactory = candidateLoggerFactory ?? { _ in
+            IMAPLogger(
+                outboundLogger: Logging.Logger(label: outboundLabel),
+                inboundLogger: Logging.Logger(label: inboundLabel)
+            )
+        }
 
         self.logger = Logging.Logger(label: loggerLabel)
-        let outboundLogger = Logging.Logger(label: outboundLabel)
-        let inboundLogger = Logging.Logger(label: inboundLabel)
-        self.duplexLogger = IMAPLogger(outboundLogger: outboundLogger, inboundLogger: inboundLogger)
     }
 
     var isConnected: Bool {
         lifecycleState.withLockedValue { state in
-            state.channel?.isActive ?? false
+            state.adoptedTransport?.channel.isActive ?? false
         }
     }
 
@@ -171,7 +188,7 @@ final class IMAPConnection {
             guard state.pendingConnect == nil else {
                 return IMAPError.connectionFailed("Connection attempt already in progress")
             }
-            guard state.channel == nil else {
+            guard state.adoptedTransport == nil else {
                 return IMAPError.connectionFailed("Connection already established")
             }
             state.pendingConnect = pendingConnect
@@ -189,19 +206,27 @@ final class IMAPConnection {
 
         let lifecycleState = self.lifecycleState
         let connectAttemptID = pendingConnect.id
-        let registerChannel: @Sendable (Channel) -> Void = { channel in
+        let candidateLoggerFactory = self.candidateLoggerFactory
+        let createAndRegisterCandidate: @Sendable (Channel) -> OwnedTransportRegistration = { channel in
             Self.registerOwnedChannel(
                 channel,
+                duplexLogger: candidateLoggerFactory(channel),
                 connectAttemptID: connectAttemptID,
                 lifecycleState: lifecycleState
             )
+        }
+        let registerChannel: @Sendable (Channel) -> EventLoopFuture<Void> = { channel in
+            let registration = createAndRegisterCandidate(channel)
+            guard registration.wasInserted else {
+                return channel.eventLoop.makeSucceededFuture(())
+            }
+            return channel.pipeline.addHandler(registration.duplexLogger)
         }
 
         let connectFuture: EventLoopFuture<Channel>
         if let connectOverride {
             connectFuture = connectOverride(registerChannel)
         } else {
-            let duplexLogger = self.duplexLogger
             let tlsHandlerFactory = self.tlsHandlerFactory
             connectFuture = ClientBootstrap(group: group)
                 // Make the NIO-owned Happy-Eyeballs attempt explicitly bounded.
@@ -211,7 +236,11 @@ final class IMAPConnection {
                 .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
                 .channelOption(ChannelOptions.socket(IPPROTO_TCP, TCP_NODELAY), value: 1)
                 .channelInitializer { channel in
-                    registerChannel(channel)
+                    // SwiftNIO may invoke this initializer for multiple
+                    // Happy-Eyeballs candidates. Every candidate must own a
+                    // distinct stateful logger instance.
+                    let registration = createAndRegisterCandidate(channel)
+                    let duplexLogger = registration.duplexLogger
 
                     let accepted = lifecycleState.withLockedValue { state in
                         !state.isRetired
@@ -353,7 +382,7 @@ final class IMAPConnection {
             if state.idleHandler != nil, shouldSendDone {
                 state.idleTerminationInProgress = true
             }
-            return (state.idleHandler, state.channel, shouldSendDone)
+            return (state.idleHandler, state.adoptedTransport?.channel, shouldSendDone)
         }
 
         guard let handler = snapshot.0 else {
@@ -440,8 +469,8 @@ final class IMAPConnection {
             guard !state.isGracefulDisconnectInProgress else { return (false, [], state.pendingConnect) }
 
             state.isGracefulDisconnectInProgress = true
-            state.channel = nil
-            return (true, Array(state.ownedChannels.values), state.pendingConnect)
+            state.adoptedTransport = nil
+            return (true, state.ownedTransports.values.map(\.channel), state.pendingConnect)
         }
 
         guard snapshot.didBegin else {
@@ -501,10 +530,10 @@ final class IMAPConnection {
             let didRetire = !state.isRetired
             state.isRetired = true
             let idleHandler = state.idleHandler
-            state.channel = nil
+            state.adoptedTransport = nil
             state.idleHandler = nil
             state.idleTerminationInProgress = false
-            return (didRetire, Array(state.ownedChannels.values), idleHandler, state.pendingConnect)
+            return (didRetire, state.ownedTransports.values.map(\.channel), idleHandler, state.pendingConnect)
         }
 
         await commandQueue.abort()
@@ -618,14 +647,16 @@ final class IMAPConnection {
 
         clearInvalidChannel()
 
-        if currentChannel == nil {
+        if currentTransport == nil {
             logger.info("Channel is nil, re-establishing connection before authentication")
             try await connect()
         }
 
-        guard let channel = currentChannel else {
+        guard let transport = currentTransport else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
+        let channel = transport.channel
+        let duplexLogger = transport.duplexLogger
 
         let expectsChallenge = !capabilities.contains(.saslIR)
         let tag = generateCommandTag()
@@ -815,14 +846,16 @@ final class IMAPConnection {
 
         clearInvalidChannel()
 
-        if currentChannel == nil {
+        if currentTransport == nil {
             logger.info("Channel is nil, re-establishing connection before sending command")
             try await connect()
         }
 
-        guard let channel = currentChannel else {
+        guard let transport = currentTransport else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
+        let channel = transport.channel
+        let duplexLogger = transport.duplexLogger
 
         let resultPromise = channel.eventLoop.makePromise(of: CommandType.ResultType.self)
         let tag = generateCommandTag()
@@ -867,14 +900,16 @@ final class IMAPConnection {
         try ensureNotRetired()
         clearInvalidChannel()
 
-        if currentChannel == nil {
+        if currentTransport == nil {
             logger.info("Channel is nil, re-establishing connection before executing handler")
             try await connect()
         }
 
-        guard let channel = currentChannel else {
+        guard let transport = currentTransport else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
+        let channel = transport.channel
+        let duplexLogger = transport.duplexLogger
 
         let resultPromise = channel.eventLoop.makePromise(of: T.self)
         let handler = HandlerType.init(commandTag: "", promise: resultPromise)
@@ -911,8 +946,8 @@ final class IMAPConnection {
 
     private func clearInvalidChannel() {
         let didClear = lifecycleState.withLockedValue { state in
-            if let channel = state.channel, !channel.isActive {
-                state.channel = nil
+            if let transport = state.adoptedTransport, !transport.channel.isActive {
+                state.adoptedTransport = nil
                 return true
             }
             return false
@@ -929,38 +964,50 @@ final class IMAPConnection {
     /// becomes the selected connection or graceful close has already begun.
     private static func registerOwnedChannel(
         _ channel: Channel,
+        duplexLogger: IMAPLogger,
         connectAttemptID: UUID? = nil,
         lifecycleState: NIOLockedValueBox<LifecycleState>
-    ) {
+    ) -> OwnedTransportRegistration {
         let identifier = ObjectIdentifier(channel)
-        let shouldClose = lifecycleState.withLockedValue { state -> Bool in
-            state.ownedChannels[identifier] = channel
+        let registration = lifecycleState.withLockedValue { state -> (logger: IMAPLogger, inserted: Bool, shouldClose: Bool) in
+            if let existing = state.ownedTransports[identifier] {
+                return (existing.duplexLogger, false, false)
+            }
+
+            let transport = OwnedTransport(channel: channel, duplexLogger: duplexLogger)
+            state.ownedTransports[identifier] = transport
             guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
-                return true
+                return (duplexLogger, true, true)
             }
             if let connectAttemptID {
-                return state.pendingConnect?.id != connectAttemptID
+                return (duplexLogger, true, state.pendingConnect?.id != connectAttemptID)
             }
-            return false
+            return (duplexLogger, true, false)
         }
 
-        channel.closeFuture.whenComplete { _ in
-            lifecycleState.withLockedValue { state in
-                state.ownedChannels.removeValue(forKey: identifier)
-                if let active = state.channel, active === channel {
-                    state.channel = nil
+        if registration.inserted {
+            channel.closeFuture.whenComplete { _ in
+                lifecycleState.withLockedValue { state in
+                    state.ownedTransports.removeValue(forKey: identifier)
+                    if let adopted = state.adoptedTransport, adopted.channel === channel {
+                        state.adoptedTransport = nil
+                    }
                 }
             }
         }
 
-        if shouldClose {
+        if registration.shouldClose {
             channel.close(mode: CloseMode.all, promise: nil)
         }
+        return OwnedTransportRegistration(
+            duplexLogger: registration.logger,
+            wasInserted: registration.inserted
+        )
     }
 
     private func closeRemainingOwnedChannels() async {
         while true {
-            let channels = lifecycleState.withLockedValue { Array($0.ownedChannels.values) }
+            let channels = lifecycleState.withLockedValue { $0.ownedTransports.values.map(\.channel) }
             guard !channels.isEmpty else { return }
 
             for channel in channels {
@@ -987,7 +1034,11 @@ final class IMAPConnection {
                 guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
                     return Self.currentTeardownError(state: state)
                 }
-                state.channel = channel
+                guard let registered = state.ownedTransports[ObjectIdentifier(channel)],
+                      registered.channel === channel else {
+                    return IMAPError.connectionFailed("Connected channel was not registered")
+                }
+                state.adoptedTransport = registered
                 return nil
             }
 
@@ -1025,7 +1076,7 @@ final class IMAPConnection {
             guard state.pendingConnect?.id == pendingConnect.id,
                   !state.isRetired,
                   !state.isGracefulDisconnectInProgress,
-                  state.channel === channel else {
+                  state.adoptedTransport?.channel === channel else {
                 return false
             }
             return true
@@ -1041,8 +1092,8 @@ final class IMAPConnection {
     ) -> Channel? {
         lifecycleState.withLockedValue { state in
             guard state.pendingConnect?.id == pendingConnect.id else { return nil }
-            guard let adoptedChannel, state.channel === adoptedChannel else { return nil }
-            state.channel = nil
+            guard let adoptedChannel, state.adoptedTransport?.channel === adoptedChannel else { return nil }
+            state.adoptedTransport = nil
             return adoptedChannel
         }
     }
@@ -1076,7 +1127,7 @@ final class IMAPConnection {
     // Internal lifecycle observability used by deterministic package tests.
     // These expose only counts/booleans, never hosts, mailbox data, or secrets.
     var ownedTransportCount: Int {
-        lifecycleState.withLockedValue { $0.ownedChannels.count }
+        lifecycleState.withLockedValue { $0.ownedTransports.count }
     }
 
     var hasPendingTransportConnect: Bool {
@@ -1114,10 +1165,15 @@ final class IMAPConnection {
         _ channel: Channel,
         capabilities: Set<NIOIMAPCore.Capability> = []
     ) async throws {
-        Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
+        let duplexLogger = try await prepareCandidateChannel(channel)
         let adopted = lifecycleState.withLockedValue { state -> Bool in
             guard !state.isRetired, !state.isGracefulDisconnectInProgress else { return false }
-            state.channel = channel
+            guard let registered = state.ownedTransports[ObjectIdentifier(channel)],
+                  registered.channel === channel,
+                  registered.duplexLogger === duplexLogger else {
+                return false
+            }
+            state.adoptedTransport = registered
             return true
         }
         guard adopted else {
@@ -1129,8 +1185,34 @@ final class IMAPConnection {
         self.capabilities = capabilities
     }
 
+    /// Installs the exact per-candidate logger used by the production bootstrap
+    /// without adopting the channel. Internal for deterministic Happy-Eyeballs
+    /// ownership tests and prepared-channel callers.
+    @discardableResult
+    func prepareCandidateChannel(_ channel: Channel) async throws -> IMAPLogger {
+        if let existing = lifecycleState.withLockedValue({
+            $0.ownedTransports[ObjectIdentifier(channel)]?.duplexLogger
+        }) {
+            return existing
+        }
+
+        let registration = Self.registerOwnedChannel(
+            channel,
+            duplexLogger: candidateLoggerFactory(channel),
+            lifecycleState: lifecycleState
+        )
+        if registration.wasInserted {
+            try await channel.pipeline.addHandler(registration.duplexLogger).get()
+        }
+        return registration.duplexLogger
+    }
+
     private var currentChannel: Channel? {
-        lifecycleState.withLockedValue { $0.channel }
+        currentTransport?.channel
+    }
+
+    private var currentTransport: OwnedTransport? {
+        lifecycleState.withLockedValue { $0.adoptedTransport }
     }
 
     private func ensureNotRetired() throws {
