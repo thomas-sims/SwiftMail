@@ -729,7 +729,12 @@ struct XOAUTH2SecurityTests {
                 _ = try await connection.prepareCandidateChannel(loser)
             }
             let loserLogger = try #require(registry.logger(for: loser))
+            let winnerBuffer = try #require(registry.responseBuffer(for: winner))
+            let loserBuffer = try #require(registry.responseBuffer(for: loser))
             #expect(winnerLogger !== loserLogger)
+            #expect(winnerBuffer !== loserBuffer)
+            #expect(await pipelineContains(responseBuffer: winnerBuffer, on: winner))
+            #expect(!(await pipelineContains(responseBuffer: loserBuffer, on: loser)))
             #expect(winnerLogger.isAuthenticationRedactionActive)
             #expect(!loserLogger.isAuthenticationRedactionActive)
             #expect(winnerLogger.authenticationSensitiveTagCount == 1)
@@ -748,6 +753,10 @@ struct XOAUTH2SecurityTests {
             #expect(connection.ownedTransportCount == 0)
             #expect(winnerLogger.authenticationSensitiveTagCount == 0)
             #expect(loserLogger.authenticationSensitiveTagCount == 0)
+            #expect(!winnerBuffer.hasActiveHandler)
+            #expect(!loserBuffer.hasActiveHandler)
+            #expect(winnerBuffer.bufferedCount == 0)
+            #expect(loserBuffer.bufferedCount == 0)
             #expect(!winner.isActive)
             #expect(!loser.isActive)
 
@@ -756,7 +765,164 @@ struct XOAUTH2SecurityTests {
         }
 
         #expect(registry.creationCount == 64)
+        #expect(registry.responseBufferCreationCount == 64)
         try await group.shutdownGracefully()
+    }
+
+    @Test
+    func concurrentCandidatePreparationAndAdoptionInstallFactoriesAndBufferOnce() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let registry = CandidateLoggerRegistry()
+        let connection = makeCandidateLoggerConnection(group: group, registry: registry)
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        try await withThrowingTaskGroup(of: IMAPLogger.self) { preparations in
+            for _ in 0..<32 {
+                preparations.addTask {
+                    try await connection.prepareCandidateChannel(channel)
+                }
+            }
+            for try await logger in preparations {
+                #expect(logger === registry.logger(for: channel))
+            }
+        }
+
+        let preparedCapabilitySets: [Set<Capability>] = [[.idle], [.id]]
+        try await withThrowingTaskGroup(of: Void.self) { adoptionsAndReaders in
+            for index in 0..<32 {
+                let capabilitySet = preparedCapabilitySets[index % preparedCapabilitySets.count]
+                adoptionsAndReaders.addTask {
+                    try await connection.prepareEstablishedChannel(
+                        channel,
+                        capabilities: capabilitySet
+                    )
+                }
+            }
+            for _ in 0..<32 {
+                adoptionsAndReaders.addTask {
+                    for _ in 0..<128 {
+                        let snapshot = connection.capabilitiesSnapshot
+                        #expect(snapshot.isEmpty || preparedCapabilitySets.contains(snapshot))
+                        _ = connection.supportsCapability { $0 == .idle }
+                        _ = connection.supportsCapability { $0 == .id }
+                        await Task.yield()
+                    }
+                }
+            }
+            try await adoptionsAndReaders.waitForAll()
+        }
+
+        let responseBuffer = try #require(registry.responseBuffer(for: channel))
+        #expect(registry.creationCount == 1)
+        #expect(registry.responseBufferCreationCount == 1)
+        #expect(await pipelineContains(responseBuffer: responseBuffer, on: channel))
+
+        _ = try await channel.writeInbound(Response.untagged(.mailboxData(.exists(71))))
+        _ = try? await channel.readInbound(as: Response.self)
+        let events = connection.drainBufferedEvents()
+        #expect(events.count == 1)
+        if case .some(.exists(let count)) = events.first {
+            #expect(count == 71)
+        } else {
+            Issue.record("Expected one buffered EXISTS event")
+        }
+
+        try await connection.disconnect()
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!responseBuffer.hasActiveHandler)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func duplicateConnectOverrideRegistrationSharesOneCandidateSetup() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let registry = CandidateLoggerRegistry()
+        let channel = NIOAsyncTestingChannel()
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.duplicate-candidate",
+            outboundLabel: "test.imap.duplicate-candidate.out",
+            inboundLabel: "test.imap.duplicate-candidate.in",
+            connectOverride: { registerChannel in
+                let registrations = (0..<32).map { _ in registerChannel(channel) }
+                return EventLoopFuture.andAllSucceed(registrations, on: channel.eventLoop).map { channel }
+            },
+            candidateLoggerFactory: { candidate in registry.makeLogger(for: candidate) },
+            candidateResponseBufferFactory: { candidate in registry.makeResponseBuffer(for: candidate) }
+        )
+
+        let connect = Task { try await connection.connect() }
+        try await waitForCandidateCondition {
+            connection.isConnected && connection.hasActiveResponseHandler
+        }
+        _ = try await channel.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+            code: .capability([.imap4rev1]),
+            text: "candidate-ready"
+        )))))
+        _ = try? await channel.readInbound(as: Response.self)
+        try await connect.value
+
+        let responseBuffer = try #require(registry.responseBuffer(for: channel))
+        #expect(registry.creationCount == 1)
+        #expect(registry.responseBufferCreationCount == 1)
+        #expect(await pipelineContains(responseBuffer: responseBuffer, on: channel))
+
+        try await connection.disconnect()
+        #expect(connection.ownedTransportCount == 0)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func closedCandidateSetupFailureRetiresFactoriesAndTransport() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let registry = CandidateLoggerRegistry()
+        let channel = NIOAsyncTestingChannel()
+        try await channel.close().get()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.failed-candidate",
+            outboundLabel: "test.imap.failed-candidate.out",
+            inboundLabel: "test.imap.failed-candidate.in",
+            connectOverride: { registerChannel in
+                registerChannel(channel).map { channel }
+            },
+            candidateLoggerFactory: { candidate in registry.makeLogger(for: candidate) },
+            candidateResponseBufferFactory: { candidate in registry.makeResponseBuffer(for: candidate) }
+        )
+
+        do {
+            try await connection.connect()
+            Issue.record("Expected closed candidate pipeline setup to fail")
+        } catch {
+            // The precise NIO setup category is intentionally not public API.
+        }
+
+        try await waitForCandidateCondition { connection.ownedTransportCount == 0 }
+        #expect(registry.creationCount == 1)
+        #expect(registry.responseBufferCreationCount == 1)
+        #expect(!connection.hasActiveResponseHandler)
+        #expect(connection.drainBufferedEvents().isEmpty)
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func reconnectWaitsForOldHandlerRemovalAndNeverReplaysItsBuffer() async throws {
+        for trigger in CandidateReconnectTrigger.allCases {
+            try await verifyOldGenerationBufferIsolation(trigger: trigger)
+        }
     }
 }
 
@@ -765,11 +931,130 @@ private enum CandidateInitializationOrder: CaseIterable, Sendable {
     case winnerBeforeLateLoser
 }
 
+private enum CandidateReconnectTrigger: CaseIterable, Sendable {
+    case directConnect
+    case noopAutomaticReconnect
+}
+
 private let candidateAuthenticationCapabilities: Set<Capability> = [
     .imap4rev1,
     .authenticate(AuthenticationMechanism("XOAUTH2")),
     .saslIR,
 ]
+
+private func verifyOldGenerationBufferIsolation(
+    trigger: CandidateReconnectTrigger
+) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let oldEventLoop = NIOAsyncTestingEventLoop()
+    let newEventLoop = NIOAsyncTestingEventLoop()
+    let inactiveBlocker = BlockingChannelInactiveHandler()
+    let oldChannel = await NIOAsyncTestingChannel(handler: inactiveBlocker, loop: oldEventLoop)
+    let newChannel = NIOAsyncTestingChannel(loop: newEventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await oldChannel.connect(to: address).get()
+    try await newChannel.connect(to: address).get()
+
+    let registry = CandidateLoggerRegistry()
+    let connection = IMAPConnection(
+        host: "invalid.invalid",
+        port: 993,
+        group: group,
+        loggerLabel: "test.imap.buffer-generation",
+        outboundLabel: "test.imap.buffer-generation.out",
+        inboundLabel: "test.imap.buffer-generation.in",
+        connectOverride: { registerChannel in
+            registerChannel(newChannel).map { newChannel }
+        },
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) },
+        candidateResponseBufferFactory: { channel in registry.makeResponseBuffer(for: channel) }
+    )
+    try await connection.prepareEstablishedChannel(oldChannel)
+
+    let oldBuffer = try #require(registry.responseBuffer(for: oldChannel))
+    #expect(await pipelineContains(responseBuffer: oldBuffer, on: oldChannel))
+    let staleResponses: [Response] = [
+        .untagged(.mailboxData(.exists(41))),
+        .untagged(.conditionalState(.ok(.init(code: .alert, text: "old-alert-marker")))),
+        .untagged(.conditionalState(.bye(.init(text: "old-bye-marker")))),
+        .fatal(.init(text: "old-fatal-marker")),
+    ]
+    for response in staleResponses {
+        _ = try await oldChannel.writeInbound(response)
+        _ = try? await oldChannel.readInbound(as: Response.self)
+    }
+    #expect(oldBuffer.bufferedCount == staleResponses.count)
+
+    let oldClose = Task { try await oldChannel.close().get() }
+    try await waitForCandidateCondition { inactiveBlocker.hasEntered }
+    #expect(!oldChannel.isActive)
+
+    let operation = Task { () throws -> [IMAPServerEvent]? in
+        switch trigger {
+        case .directConnect:
+            try await connection.connect()
+            return nil
+        case .noopAutomaticReconnect:
+            return try await connection.noop()
+        }
+    }
+
+    // Neither direct connect nor the automatic NOOP reconnect may publish a
+    // new generation until old channelInactive/handler removal/closeFuture is joined.
+    try await Task.sleep(nanoseconds: 25_000_000)
+    #expect(registry.creationCount == 1)
+    #expect(registry.responseBufferCreationCount == 1)
+    #expect(connection.ownedTransportCount == 1)
+    #expect(connection.drainBufferedEvents().isEmpty)
+
+    inactiveBlocker.release()
+    try await oldClose.value
+    try await waitForCandidateCondition {
+        connection.isConnected && connection.hasActiveResponseHandler
+    }
+    _ = try await newChannel.writeInbound(Response.untagged(.conditionalState(.ok(.init(
+        code: .capability([.imap4rev1]),
+        text: "new-generation-ready"
+    )))))
+    _ = try? await newChannel.readInbound(as: Response.self)
+
+    if trigger == .noopAutomaticReconnect {
+        let noopCommand = try await nextTaggedCommand(on: newChannel)
+        _ = try await newChannel.writeInbound(Response.tagged(.init(
+            tag: noopCommand.tag,
+            state: .ok(.init(text: "new-generation-noop-complete"))
+        )))
+        _ = try? await newChannel.readInbound(as: Response.self)
+    }
+    let operationEvents = try await operation.value
+    #expect(operationEvents?.isEmpty ?? true)
+
+    let newBuffer = try #require(registry.responseBuffer(for: newChannel))
+    #expect(registry.creationCount == 2)
+    #expect(registry.responseBufferCreationCount == 2)
+    #expect(oldBuffer !== newBuffer)
+    #expect(oldBuffer.bufferedCount == 0)
+    #expect(!oldBuffer.hasActiveHandler)
+    #expect(await pipelineContains(responseBuffer: newBuffer, on: newChannel))
+    #expect(!(await pipelineContains(responseBuffer: oldBuffer, on: newChannel)))
+    #expect(connection.drainBufferedEvents().isEmpty)
+
+    _ = try await newChannel.writeInbound(Response.untagged(.mailboxData(.exists(99))))
+    _ = try? await newChannel.readInbound(as: Response.self)
+    let newEvents = connection.drainBufferedEvents()
+    #expect(newEvents.count == 1)
+    if case .some(.exists(let count)) = newEvents.first {
+        #expect(count == 99)
+    } else {
+        Issue.record("Expected only the new generation EXISTS event")
+    }
+
+    try await connection.disconnect()
+    #expect(connection.ownedTransportCount == 0)
+    _ = try? await oldChannel.finish(acceptAlreadyClosed: true)
+    _ = try? await newChannel.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
 
 private func verifyConnectOverrideCandidateLoggerAuthority(
     order: CandidateInitializationOrder
@@ -800,7 +1085,8 @@ private func verifyConnectOverrideCandidateLoggerAuthority(
             }
             return registrations.map { winner }
         },
-        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) }
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) },
+        candidateResponseBufferFactory: { channel in registry.makeResponseBuffer(for: channel) }
     )
 
     let connect = Task { try await connection.connect() }
@@ -956,7 +1242,8 @@ private func makeCandidateLoggerConnection(
         loggerLabel: "test.imap.candidate.connection",
         outboundLabel: "test.imap.candidate.out",
         inboundLabel: "test.imap.candidate.in",
-        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) }
+        candidateLoggerFactory: { channel in registry.makeLogger(for: channel) },
+        candidateResponseBufferFactory: { channel in registry.makeResponseBuffer(for: channel) }
     )
 }
 
@@ -990,6 +1277,20 @@ private func waitForCandidateCondition(
         }
         try await Task.sleep(nanoseconds: 1_000_000)
     }
+}
+
+private func pipelineContains(
+    responseBuffer: UntaggedResponseBuffer,
+    on channel: Channel
+) async -> Bool {
+    (try? await channel.eventLoop.submit {
+        do {
+            _ = try channel.pipeline.syncOperations.context(handler: responseBuffer)
+            return true
+        } catch {
+            return false
+        }
+    }.get()) ?? false
 }
 
 private enum AuthenticationChallengeFixture {
@@ -1285,13 +1586,15 @@ private final class LogCapture: @unchecked Sendable {
 
 private final class CandidateLoggerRegistry: @unchecked Sendable {
     private struct Entry {
-        let logger: IMAPLogger
-        let capture: LogCapture
+        var logger: IMAPLogger? = nil
+        var capture: LogCapture? = nil
+        var responseBuffer: UntaggedResponseBuffer? = nil
     }
 
     private let lock = NSLock()
     private var entries: [ObjectIdentifier: Entry] = [:]
     private var storedCreationCount = 0
+    private var storedResponseBufferCreationCount = 0
 
     var entryCount: Int {
         lock.withLock { entries.count }
@@ -1301,15 +1604,35 @@ private final class CandidateLoggerRegistry: @unchecked Sendable {
         lock.withLock { storedCreationCount }
     }
 
+    var responseBufferCreationCount: Int {
+        lock.withLock { storedResponseBufferCreationCount }
+    }
+
     func makeLogger(for channel: Channel) -> IMAPLogger {
         let capture = LogCapture()
         let logger = makeCaptureLogger(label: "test.imap.candidate.transport", capture: capture)
         let imapLogger = IMAPLogger(outboundLogger: logger, inboundLogger: logger)
         lock.withLock {
             storedCreationCount += 1
-            entries[ObjectIdentifier(channel)] = Entry(logger: imapLogger, capture: capture)
+            let identifier = ObjectIdentifier(channel)
+            var entry = entries[identifier] ?? Entry()
+            entry.logger = imapLogger
+            entry.capture = capture
+            entries[identifier] = entry
         }
         return imapLogger
+    }
+
+    func makeResponseBuffer(for channel: Channel) -> UntaggedResponseBuffer {
+        let responseBuffer = UntaggedResponseBuffer()
+        lock.withLock {
+            storedResponseBufferCreationCount += 1
+            let identifier = ObjectIdentifier(channel)
+            var entry = entries[identifier] ?? Entry()
+            entry.responseBuffer = responseBuffer
+            entries[identifier] = entry
+        }
+        return responseBuffer
     }
 
     func logger(for channel: Channel) -> IMAPLogger? {
@@ -1318,6 +1641,32 @@ private final class CandidateLoggerRegistry: @unchecked Sendable {
 
     func capture(for channel: Channel) -> LogCapture? {
         lock.withLock { entries[ObjectIdentifier(channel)]?.capture }
+    }
+
+    func responseBuffer(for channel: Channel) -> UntaggedResponseBuffer? {
+        lock.withLock { entries[ObjectIdentifier(channel)]?.responseBuffer }
+    }
+}
+
+private final class BlockingChannelInactiveHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = Response
+
+    private let lock = NSLock()
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var entered = false
+
+    var hasEntered: Bool {
+        lock.withLock { entered }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        lock.withLock { entered = true }
+        releaseSemaphore.wait()
+        context.fireChannelInactive()
+    }
+
+    func release() {
+        releaseSemaphore.signal()
     }
 }
 

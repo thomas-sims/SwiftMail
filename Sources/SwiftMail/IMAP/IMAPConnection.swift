@@ -11,6 +11,7 @@ final class IMAPConnection {
     typealias ConnectOverride = (@escaping @Sendable (Channel) -> EventLoopFuture<Void>) -> EventLoopFuture<Channel>
     typealias TLSHandlerFactory = @Sendable (NIOSSLContext, String?) throws -> ChannelHandler
     typealias CandidateLoggerFactory = @Sendable (Channel) -> IMAPLogger
+    typealias CandidateResponseBufferFactory = @Sendable (Channel) -> UntaggedResponseBuffer
 
     struct ConnectionTarget: Equatable, Sendable {
         let connectionHost: String
@@ -88,14 +89,53 @@ final class IMAPConnection {
         }
     }
 
-    private struct OwnedTransport {
+    private final class OwnedTransport: @unchecked Sendable {
         let channel: Channel
         let duplexLogger: IMAPLogger
+        let responseBuffer: UntaggedResponseBuffer
+        let loggerInstallationPromise: EventLoopPromise<Void>
+        let responseBufferInstallationPromise: EventLoopPromise<Void>
+
+        private struct InstallationState {
+            var loggerStarted = false
+            var responseBufferStarted = false
+        }
+
+        private let installationState = NIOLockedValueBox(InstallationState())
+
+        init(
+            channel: Channel,
+            duplexLogger: IMAPLogger,
+            responseBuffer: UntaggedResponseBuffer
+        ) {
+            self.channel = channel
+            self.duplexLogger = duplexLogger
+            self.responseBuffer = responseBuffer
+            self.loggerInstallationPromise = channel.eventLoop.makePromise(of: Void.self)
+            self.responseBufferInstallationPromise = channel.eventLoop.makePromise(of: Void.self)
+        }
+
+        func claimLoggerInstallation() -> Bool {
+            installationState.withLockedValue { state in
+                guard !state.loggerStarted else { return false }
+                state.loggerStarted = true
+                return true
+            }
+        }
+
+        func claimResponseBufferInstallation() -> Bool {
+            installationState.withLockedValue { state in
+                guard !state.responseBufferStarted else { return false }
+                state.responseBufferStarted = true
+                return true
+            }
+        }
     }
 
     private struct OwnedTransportRegistration {
-        let duplexLogger: IMAPLogger
+        let transport: OwnedTransport
         let wasInserted: Bool
+        let shouldClose: Bool
     }
 
     private struct LifecycleState {
@@ -113,7 +153,9 @@ final class IMAPConnection {
         /// closed all of its transports.
         var isGracefulDisconnectInProgress = false
         var idleHandler: IdleHandler?
+        var idleTransport: OwnedTransport?
         var idleTerminationInProgress = false
+        var capabilities: Set<NIOIMAPCore.Capability> = []
     }
 
     private let host: String
@@ -122,11 +164,10 @@ final class IMAPConnection {
     private let connectOverride: ConnectOverride?
     private let tlsHandlerFactory: TLSHandlerFactory
     private let candidateLoggerFactory: CandidateLoggerFactory
+    private let candidateResponseBufferFactory: CandidateResponseBufferFactory
     private let lifecycleState = NIOLockedValueBox(LifecycleState())
     private var commandTagCounter: Int = 0
-    private var capabilities: Set<NIOIMAPCore.Capability> = []
     private let commandQueue = IMAPCommandQueue()
-    private let responseBuffer = UntaggedResponseBuffer()
 
     private let logger: Logging.Logger
 
@@ -139,7 +180,8 @@ final class IMAPConnection {
         inboundLabel: String,
         connectOverride: ConnectOverride? = nil,
         tlsHandlerFactory: TLSHandlerFactory? = nil,
-        candidateLoggerFactory: CandidateLoggerFactory? = nil
+        candidateLoggerFactory: CandidateLoggerFactory? = nil,
+        candidateResponseBufferFactory: CandidateResponseBufferFactory? = nil
     ) {
         self.host = host
         self.port = port
@@ -154,6 +196,9 @@ final class IMAPConnection {
                 inboundLogger: Logging.Logger(label: inboundLabel)
             )
         }
+        self.candidateResponseBufferFactory = candidateResponseBufferFactory ?? { _ in
+            UntaggedResponseBuffer()
+        }
 
         self.logger = Logging.Logger(label: loggerLabel)
     }
@@ -165,14 +210,16 @@ final class IMAPConnection {
     }
 
     var capabilitiesSnapshot: Set<NIOIMAPCore.Capability> {
-        capabilities
+        lifecycleState.withLockedValue { $0.capabilities }
     }
 
     func supportsCapability(_ check: (Capability) -> Bool) -> Bool {
-        capabilities.contains(where: check)
+        capabilitiesSnapshot.contains(where: check)
     }
 
     func connect() async throws {
+        try ensureNotRetired()
+        try await closeLingeringTransportsBeforeConnect()
         try ensureNotRetired()
 
         let target = try Self.connectionTarget(for: host)
@@ -207,20 +254,19 @@ final class IMAPConnection {
         let lifecycleState = self.lifecycleState
         let connectAttemptID = pendingConnect.id
         let candidateLoggerFactory = self.candidateLoggerFactory
+        let candidateResponseBufferFactory = self.candidateResponseBufferFactory
         let createAndRegisterCandidate: @Sendable (Channel) -> OwnedTransportRegistration = { channel in
             Self.registerOwnedChannel(
                 channel,
-                duplexLogger: candidateLoggerFactory(channel),
+                candidateLoggerFactory: candidateLoggerFactory,
+                candidateResponseBufferFactory: candidateResponseBufferFactory,
                 connectAttemptID: connectAttemptID,
                 lifecycleState: lifecycleState
             )
         }
         let registerChannel: @Sendable (Channel) -> EventLoopFuture<Void> = { channel in
             let registration = createAndRegisterCandidate(channel)
-            guard registration.wasInserted else {
-                return channel.eventLoop.makeSucceededFuture(())
-            }
-            return channel.pipeline.addHandler(registration.duplexLogger)
+            return Self.installCandidateLoggerIfNeeded(registration)
         }
 
         let connectFuture: EventLoopFuture<Channel>
@@ -240,7 +286,7 @@ final class IMAPConnection {
                     // Happy-Eyeballs candidates. Every candidate must own a
                     // distinct stateful logger instance.
                     let registration = createAndRegisterCandidate(channel)
-                    let duplexLogger = registration.duplexLogger
+                    let transport = registration.transport
 
                     let accepted = lifecycleState.withLockedValue { state in
                         !state.isRetired
@@ -248,9 +294,18 @@ final class IMAPConnection {
                             && state.pendingConnect?.id == connectAttemptID
                     }
                     guard accepted else {
+                        if transport.claimLoggerInstallation() {
+                            transport.loggerInstallationPromise.fail(
+                                Self.currentTeardownError(lifecycleState: lifecycleState)
+                            )
+                        }
                         return channel.close(mode: .all).flatMapThrowing {
                             throw Self.currentTeardownError(lifecycleState: lifecycleState)
                         }
+                    }
+
+                    guard transport.claimLoggerInstallation() else {
+                        return transport.loggerInstallationPromise.futureResult
                     }
 
                     do {
@@ -266,11 +321,13 @@ final class IMAPConnection {
                         try channel.pipeline.syncOperations.addHandlers([
                             sslHandler,
                             IMAPClientHandler(parserOptions: parserOptions),
-                            duplexLogger
+                            transport.duplexLogger
                         ])
+                        transport.loggerInstallationPromise.succeed(())
 
                         return channel.eventLoop.makeSucceededFuture(())
                     } catch {
+                        transport.loggerInstallationPromise.fail(error)
                         // Channel-initializer failures must fail the bootstrap future.
                         // Never crash or fall back to plaintext/permissive TLS.
                         return channel.eventLoop.makeFailedFuture(error)
@@ -289,12 +346,19 @@ final class IMAPConnection {
             let channel = try await pendingConnect.promise.futureResult.get()
             adoptedChannel = channel
 
-            // Add the persistent untagged response buffer as the LAST handler in the pipeline.
-            // Transient command handlers are added BEFORE it (position: .before(responseBuffer)).
+            guard let adoptedTransport = currentTransport,
+                  adoptedTransport.channel === channel else {
+                throw IMAPError.connectionFailed("Adopted transport authority was lost")
+            }
+
+            // Add this generation's persistent untagged response buffer as the
+            // LAST handler in the adopted pipeline. Transient command handlers
+            // are added before this exact buffer. Candidate buffers are created
+            // at reservation time but never installed on losing pipelines.
             // channelRead flows first→last, so: command handler processes response → calls
             // fireChannelRead → buffer sees it. When no command handler is active, responses
             // flow directly to the buffer which captures them for later draining.
-            try await channel.pipeline.addHandler(responseBuffer).get()
+            try await Self.installResponseBufferIfNeeded(on: adoptedTransport).get()
 
             try ensureNotRetired()
 
@@ -329,7 +393,7 @@ final class IMAPConnection {
     @discardableResult func fetchCapabilities() async throws -> [Capability] {
         let command = CapabilityCommand()
         let serverCapabilities = try await executeCommand(command)
-        self.capabilities = Set(serverCapabilities)
+        lifecycleState.withLockedValue { $0.capabilities = Set(serverCapabilities) }
         return serverCapabilities
     }
 
@@ -346,7 +410,7 @@ final class IMAPConnection {
     }
 
     func id(_ identification: Identification = Identification()) async throws -> Identification {
-        guard capabilities.contains(.id) else {
+        guard capabilitiesSnapshot.contains(.id) else {
             throw IMAPError.commandNotSupported("ID command not supported by server")
         }
 
@@ -382,7 +446,7 @@ final class IMAPConnection {
             if state.idleHandler != nil, shouldSendDone {
                 state.idleTerminationInProgress = true
             }
-            return (state.idleHandler, state.adoptedTransport?.channel, shouldSendDone)
+            return (state.idleHandler, state.idleTransport, shouldSendDone)
         }
 
         guard let handler = snapshot.0 else {
@@ -397,22 +461,25 @@ final class IMAPConnection {
                 let didResetMatchingIdle = lifecycleState.withLockedValue { state in
                     guard state.idleHandler === handler else { return false }
                     state.idleHandler = nil
+                    state.idleTransport = nil
                     state.idleTerminationInProgress = false
                     return true
                 }
                 if didResetMatchingIdle {
-                    responseBuffer.hasActiveHandler = false
+                    snapshot.1?.responseBuffer.hasActiveHandler = false
                 }
             }
         }
 
-        guard let channel = snapshot.1 else {
+        guard let transport = snapshot.1 else {
             handler.abort()
             // An already-failed shared handler keeps its original terminal
             // error; a genuinely missing transport fails every waiter instead
             // of making one caller silently report success.
             return try await handler.promise.futureResult.get()
         }
+        let channel = transport.channel
+        let responseBuffer = transport.responseBuffer
 
         // The caller that atomically installed the termination marker owns the
         // sole DONE write. Every duplicate joins the same tagged-response promise.
@@ -460,17 +527,21 @@ final class IMAPConnection {
     /// Returns them converted to `IMAPServerEvent`s. Responses that don't map
     /// to a known event type are logged and skipped.
     func drainBufferedEvents() -> [IMAPServerEvent] {
-        responseBuffer.drainServerEvents(logger: logger)
+        guard let transport = currentTransport else { return [] }
+        let events = transport.responseBuffer.drainServerEvents(logger: logger)
+        return lifecycleState.withLockedValue { state in
+            state.adoptedTransport === transport ? events : []
+        }
     }
 
     func disconnect() async throws {
-        let snapshot = lifecycleState.withLockedValue { state -> (didBegin: Bool, channels: [Channel], pendingConnect: PendingConnect?) in
+        let snapshot = lifecycleState.withLockedValue { state -> (didBegin: Bool, transports: [OwnedTransport], pendingConnect: PendingConnect?) in
             guard !state.isRetired else { return (false, [], nil) }
             guard !state.isGracefulDisconnectInProgress else { return (false, [], state.pendingConnect) }
 
             state.isGracefulDisconnectInProgress = true
             state.adoptedTransport = nil
-            return (true, state.ownedTransports.values.map(\.channel), state.pendingConnect)
+            return (true, Array(state.ownedTransports.values), state.pendingConnect)
         }
 
         guard snapshot.didBegin else {
@@ -485,17 +556,18 @@ final class IMAPConnection {
         // factory handoff, underlying future, and caller settlement below.
         snapshot.pendingConnect?.completeChannel(with: .failure(Self.teardownError))
 
-        if snapshot.channels.isEmpty, snapshot.pendingConnect == nil {
+        if snapshot.transports.isEmpty, snapshot.pendingConnect == nil {
             logger.warning("Attempted to disconnect when channel was already nil")
         }
 
-        for channel in snapshot.channels {
-            channel.close(mode: CloseMode.all, promise: nil)
+        for transport in snapshot.transports {
+            transport.responseBuffer.hasActiveHandler = false
+            transport.channel.close(mode: CloseMode.all, promise: nil)
         }
         var firstCloseError: Error?
-        for channel in snapshot.channels {
+        for transport in snapshot.transports {
             do {
-                try await channel.closeFuture.get()
+                try await transport.channel.closeFuture.get()
             } catch {
                 if firstCloseError == nil { firstCloseError = error }
             }
@@ -512,11 +584,11 @@ final class IMAPConnection {
         // settled. Drain candidates surfaced during the initial close snapshot.
         await closeRemainingOwnedChannels()
 
-        capabilities = []
         lifecycleState.withLockedValue { state in
             if state.pendingConnect?.id == snapshot.pendingConnect?.id {
                 state.pendingConnect = nil
             }
+            state.capabilities = []
             state.isGracefulDisconnectInProgress = false
         }
 
@@ -526,18 +598,21 @@ final class IMAPConnection {
     /// Permanently retire this connection and immediately tear down its transport.
     /// No DONE or LOGOUT command is sent, and future commands cannot reconnect it.
     func hardAbort() async {
-        let snapshot = lifecycleState.withLockedValue { state -> (didRetire: Bool, channels: [Channel], idleHandler: IdleHandler?, pendingConnect: PendingConnect?) in
+        let snapshot = lifecycleState.withLockedValue { state -> (didRetire: Bool, transports: [OwnedTransport], idleHandler: IdleHandler?, pendingConnect: PendingConnect?) in
             let didRetire = !state.isRetired
             state.isRetired = true
             let idleHandler = state.idleHandler
             state.adoptedTransport = nil
             state.idleHandler = nil
+            state.idleTransport = nil
             state.idleTerminationInProgress = false
-            return (didRetire, state.ownedTransports.values.map(\.channel), idleHandler, state.pendingConnect)
+            return (didRetire, Array(state.ownedTransports.values), idleHandler, state.pendingConnect)
         }
 
         await commandQueue.abort()
-        responseBuffer.hasActiveHandler = false
+        for transport in snapshot.transports {
+            transport.responseBuffer.hasActiveHandler = false
+        }
         snapshot.idleHandler?.abort()
         if snapshot.didRetire {
             snapshot.pendingConnect?.completeChannel(with: .failure(Self.abortedError))
@@ -547,11 +622,11 @@ final class IMAPConnection {
         // Happy-Eyeballs candidates and channels already in graceful teardown.
         // Issue all closes before awaiting any one close so one slow transport
         // cannot postpone retirement of its siblings.
-        for channel in snapshot.channels {
-            channel.close(mode: CloseMode.all, promise: nil)
+        for transport in snapshot.transports {
+            transport.channel.close(mode: CloseMode.all, promise: nil)
         }
-        for channel in snapshot.channels {
-            try? await channel.closeFuture.get()
+        for transport in snapshot.transports {
+            try? await transport.channel.closeFuture.get()
         }
 
         // Failing the public wrapper promise is not transport cancellation.
@@ -627,7 +702,7 @@ final class IMAPConnection {
 
     private func refreshCapabilities(using reportedCapabilities: [Capability]) async throws {
         if !reportedCapabilities.isEmpty {
-            self.capabilities = Set(reportedCapabilities)
+            lifecycleState.withLockedValue { $0.capabilities = Set(reportedCapabilities) }
         } else {
             try await fetchCapabilities()
         }
@@ -638,8 +713,9 @@ final class IMAPConnection {
 
         let mechanism = AuthenticationMechanism("XOAUTH2")
         let xoauthCapability = Capability.authenticate(mechanism)
+        let advertisedCapabilities = capabilitiesSnapshot
 
-        guard capabilities.contains(xoauthCapability) else {
+        guard advertisedCapabilities.contains(xoauthCapability) else {
             throw IMAPError.unsupportedAuthMechanism("XOAUTH2 not advertised by server")
         }
 
@@ -657,8 +733,9 @@ final class IMAPConnection {
         }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
+        let responseBuffer = transport.responseBuffer
 
-        let expectsChallenge = !capabilities.contains(.saslIR)
+        let expectsChallenge = !advertisedCapabilities.contains(.saslIR)
         let tag = generateCommandTag()
 
         let handlerPromise = channel.eventLoop.makePromise(of: [Capability].self)
@@ -743,7 +820,7 @@ final class IMAPConnection {
     func startIdleSession(continuation: AsyncStream<IMAPServerEvent>.Continuation) async throws {
         try ensureNotRetired()
 
-        if !capabilities.contains(.idle) {
+        if !capabilitiesSnapshot.contains(.idle) {
             throw IMAPError.commandNotSupported("IDLE command not supported by server")
         }
 
@@ -754,19 +831,24 @@ final class IMAPConnection {
             throw IMAPError.commandFailed("IDLE session already active")
         }
 
-        guard let channel = currentChannel else {
+        guard let transport = currentTransport else {
             throw IMAPError.connectionFailed("Channel not initialized")
         }
+        let channel = transport.channel
+        let responseBuffer = transport.responseBuffer
 
         let promise = channel.eventLoop.makePromise(of: Void.self)
         let tag = generateCommandTag()
         let handler = IdleHandler(commandTag: tag, promise: promise, continuation: continuation)
         let registered = lifecycleState.withLockedValue { state in
-            guard !state.isRetired, state.idleHandler == nil else {
+            guard !state.isRetired,
+                  state.idleHandler == nil,
+                  state.adoptedTransport === transport else {
                 return false
             }
             state.idleTerminationInProgress = false
             state.idleHandler = handler
+            state.idleTransport = transport
             return true
         }
 
@@ -788,6 +870,7 @@ final class IMAPConnection {
             lifecycleState.withLockedValue { state in
                 if state.idleHandler === handler {
                     state.idleHandler = nil
+                    state.idleTransport = nil
                 }
                 state.idleTerminationInProgress = false
             }
@@ -856,6 +939,7 @@ final class IMAPConnection {
         }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
+        let responseBuffer = transport.responseBuffer
 
         let resultPromise = channel.eventLoop.makePromise(of: CommandType.ResultType.self)
         let tag = generateCommandTag()
@@ -910,6 +994,7 @@ final class IMAPConnection {
         }
         let channel = transport.channel
         let duplexLogger = transport.duplexLogger
+        let responseBuffer = transport.responseBuffer
 
         let resultPromise = channel.eventLoop.makePromise(of: T.self)
         let handler = HandlerType.init(commandTag: "", promise: resultPromise)
@@ -964,57 +1049,179 @@ final class IMAPConnection {
     /// becomes the selected connection or graceful close has already begun.
     private static func registerOwnedChannel(
         _ channel: Channel,
-        duplexLogger: IMAPLogger,
+        candidateLoggerFactory: CandidateLoggerFactory,
+        candidateResponseBufferFactory: CandidateResponseBufferFactory,
         connectAttemptID: UUID? = nil,
         lifecycleState: NIOLockedValueBox<LifecycleState>
     ) -> OwnedTransportRegistration {
         let identifier = ObjectIdentifier(channel)
-        let registration = lifecycleState.withLockedValue { state -> (logger: IMAPLogger, inserted: Bool, shouldClose: Bool) in
+        let registration = lifecycleState.withLockedValue { state -> OwnedTransportRegistration in
             if let existing = state.ownedTransports[identifier] {
-                return (existing.duplexLogger, false, false)
+                return OwnedTransportRegistration(
+                    transport: existing,
+                    wasInserted: false,
+                    shouldClose: false
+                )
             }
 
-            let transport = OwnedTransport(channel: channel, duplexLogger: duplexLogger)
+            // These private factories allocate handlers only and must not
+            // re-enter IMAPConnection. Creating them inside the lifecycle lock
+            // makes duplicate/concurrent reservation exactly once before any
+            // factory side effect or pipeline installation.
+            let transport = OwnedTransport(
+                channel: channel,
+                duplexLogger: candidateLoggerFactory(channel),
+                responseBuffer: candidateResponseBufferFactory(channel)
+            )
             state.ownedTransports[identifier] = transport
+
+            let shouldClose: Bool
             guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
-                return (duplexLogger, true, true)
+                return OwnedTransportRegistration(
+                    transport: transport,
+                    wasInserted: true,
+                    shouldClose: true
+                )
             }
             if let connectAttemptID {
-                return (duplexLogger, true, state.pendingConnect?.id != connectAttemptID)
+                shouldClose = state.pendingConnect?.id != connectAttemptID
+            } else {
+                shouldClose = false
             }
-            return (duplexLogger, true, false)
+            return OwnedTransportRegistration(
+                transport: transport,
+                wasInserted: true,
+                shouldClose: shouldClose
+            )
         }
 
-        if registration.inserted {
+        if registration.wasInserted {
+            let transport = registration.transport
             channel.closeFuture.whenComplete { _ in
-                lifecycleState.withLockedValue { state in
-                    state.ownedTransports.removeValue(forKey: identifier)
-                    if let adopted = state.adoptedTransport, adopted.channel === channel {
+                transport.responseBuffer.hasActiveHandler = false
+                _ = transport.responseBuffer.drainBuffer()
+                // Losing candidates never install an adopted response buffer.
+                // Resolve both setup promises on transport retirement so no
+                // unused generation leaves a pending promise behind.
+                if transport.claimLoggerInstallation() {
+                    transport.loggerInstallationPromise.fail(ChannelError.ioOnClosedChannel)
+                }
+                if transport.claimResponseBufferInstallation() {
+                    transport.responseBufferInstallationPromise.fail(ChannelError.ioOnClosedChannel)
+                }
+                let retiredIdleHandler = lifecycleState.withLockedValue { state -> IdleHandler? in
+                    if state.ownedTransports[identifier] === transport {
+                        state.ownedTransports.removeValue(forKey: identifier)
+                    }
+                    if state.adoptedTransport === transport {
                         state.adoptedTransport = nil
                     }
+                    if state.idleTransport === transport {
+                        let idleHandler = state.idleHandler
+                        state.idleHandler = nil
+                        state.idleTransport = nil
+                        state.idleTerminationInProgress = false
+                        return idleHandler
+                    }
+                    return nil
                 }
+                retiredIdleHandler?.abort()
             }
         }
 
         if registration.shouldClose {
+            if registration.transport.claimLoggerInstallation() {
+                registration.transport.loggerInstallationPromise.fail(
+                    Self.currentTeardownError(lifecycleState: lifecycleState)
+                )
+            }
             channel.close(mode: CloseMode.all, promise: nil)
         }
-        return OwnedTransportRegistration(
-            duplexLogger: registration.logger,
-            wasInserted: registration.inserted
-        )
+        return registration
+    }
+
+    private static func installCandidateLoggerIfNeeded(
+        _ registration: OwnedTransportRegistration
+    ) -> EventLoopFuture<Void> {
+        let transport = registration.transport
+        guard !registration.shouldClose else {
+            return transport.loggerInstallationPromise.futureResult
+        }
+
+        if transport.claimLoggerInstallation() {
+            let installation = transport.channel.pipeline.addHandler(transport.duplexLogger)
+            installation.cascade(to: transport.loggerInstallationPromise)
+            installation.whenFailure { _ in
+                transport.channel.close(mode: .all, promise: nil)
+            }
+        }
+        return transport.loggerInstallationPromise.futureResult
+    }
+
+    private static func installResponseBufferIfNeeded(
+        on transport: OwnedTransport
+    ) -> EventLoopFuture<Void> {
+        if transport.claimResponseBufferInstallation() {
+            let installation = transport.channel.pipeline.addHandler(transport.responseBuffer)
+            installation.cascade(to: transport.responseBufferInstallationPromise)
+            installation.whenFailure { _ in
+                transport.channel.close(mode: .all, promise: nil)
+            }
+        }
+        return transport.responseBufferInstallationPromise.futureResult
+    }
+
+    /// An inactive channel is not fully retired until NIO has run deferred
+    /// handler removal and completed `closeFuture`. Never let an automatic or
+    /// direct reconnect overlap those old generation handlers.
+    private func closeLingeringTransportsBeforeConnect() async throws {
+        while true {
+            let snapshot = lifecycleState.withLockedValue { state -> (transports: [OwnedTransport], idleHandler: IdleHandler?) in
+                guard state.pendingConnect == nil,
+                      !state.isGracefulDisconnectInProgress else {
+                    return ([], nil)
+                }
+
+                if let adopted = state.adoptedTransport {
+                    guard !adopted.channel.isActive else { return ([], nil) }
+                    state.adoptedTransport = nil
+
+                    if state.idleTransport === adopted {
+                        let idleHandler = state.idleHandler
+                        state.idleHandler = nil
+                        state.idleTransport = nil
+                        state.idleTerminationInProgress = false
+                        return (Array(state.ownedTransports.values), idleHandler)
+                    }
+                }
+                return (Array(state.ownedTransports.values), nil)
+            }
+            snapshot.idleHandler?.abort()
+            guard !snapshot.transports.isEmpty else { return }
+
+            for transport in snapshot.transports {
+                transport.responseBuffer.hasActiveHandler = false
+                transport.channel.close(mode: .all, promise: nil)
+            }
+            for transport in snapshot.transports {
+                try? await transport.channel.closeFuture.get()
+            }
+
+            try ensureNotRetired()
+        }
     }
 
     private func closeRemainingOwnedChannels() async {
         while true {
-            let channels = lifecycleState.withLockedValue { $0.ownedTransports.values.map(\.channel) }
-            guard !channels.isEmpty else { return }
+            let transports = lifecycleState.withLockedValue { Array($0.ownedTransports.values) }
+            guard !transports.isEmpty else { return }
 
-            for channel in channels {
-                channel.close(mode: CloseMode.all, promise: nil)
+            for transport in transports {
+                transport.responseBuffer.hasActiveHandler = false
+                transport.channel.close(mode: CloseMode.all, promise: nil)
             }
-            for channel in channels {
-                try? await channel.closeFuture.get()
+            for transport in transports {
+                try? await transport.channel.closeFuture.get()
             }
         }
     }
@@ -1073,10 +1280,11 @@ final class IMAPConnection {
         lifecycleState: NIOLockedValueBox<LifecycleState>
     ) -> Bool {
         lifecycleState.withLockedValue { state in
-            guard state.pendingConnect?.id == pendingConnect.id,
-                  !state.isRetired,
-                  !state.isGracefulDisconnectInProgress,
-                  state.adoptedTransport?.channel === channel else {
+                guard state.pendingConnect?.id == pendingConnect.id,
+                      !state.isRetired,
+                      !state.isGracefulDisconnectInProgress,
+                      let registered = state.ownedTransports[ObjectIdentifier(channel)],
+                      state.adoptedTransport === registered else {
                 return false
             }
             return true
@@ -1092,7 +1300,9 @@ final class IMAPConnection {
     ) -> Channel? {
         lifecycleState.withLockedValue { state in
             guard state.pendingConnect?.id == pendingConnect.id else { return nil }
-            guard let adoptedChannel, state.adoptedTransport?.channel === adoptedChannel else { return nil }
+            guard let adoptedChannel,
+                  let registered = state.ownedTransports[ObjectIdentifier(adoptedChannel)],
+                  state.adoptedTransport === registered else { return nil }
             state.adoptedTransport = nil
             return adoptedChannel
         }
@@ -1143,7 +1353,7 @@ final class IMAPConnection {
     }
 
     var hasActiveResponseHandler: Bool {
-        responseBuffer.hasActiveHandler
+        currentTransport?.responseBuffer.hasActiveHandler ?? false
     }
 
     func hasInstalledIdleHandler() async -> Bool {
@@ -1166,23 +1376,33 @@ final class IMAPConnection {
         capabilities: Set<NIOIMAPCore.Capability> = []
     ) async throws {
         let duplexLogger = try await prepareCandidateChannel(channel)
+        guard let registered = lifecycleState.withLockedValue({
+            $0.ownedTransports[ObjectIdentifier(channel)]
+        }), registered.channel === channel,
+           registered.duplexLogger === duplexLogger else {
+            channel.close(mode: .all, promise: nil)
+            throw Self.abortedError
+        }
+
+        try await Self.installResponseBufferIfNeeded(on: registered).get()
+
         let adopted = lifecycleState.withLockedValue { state -> Bool in
             guard !state.isRetired, !state.isGracefulDisconnectInProgress else { return false }
-            guard let registered = state.ownedTransports[ObjectIdentifier(channel)],
-                  registered.channel === channel,
-                  registered.duplexLogger === duplexLogger else {
+            guard state.ownedTransports[ObjectIdentifier(channel)] === registered else {
                 return false
             }
             state.adoptedTransport = registered
+            // Prepared-channel setup can be invoked concurrently by tests and
+            // deterministic embedders. Publish its generation metadata at the
+            // same serialized adoption boundary instead of racing readers or
+            // duplicate writers after the transport has become visible.
+            state.capabilities = capabilities
             return true
         }
         guard adopted else {
             channel.close(mode: .all, promise: nil)
             throw Self.abortedError
         }
-
-        try await channel.pipeline.addHandler(responseBuffer).get()
-        self.capabilities = capabilities
     }
 
     /// Installs the exact per-candidate logger used by the production bootstrap
@@ -1190,21 +1410,14 @@ final class IMAPConnection {
     /// ownership tests and prepared-channel callers.
     @discardableResult
     func prepareCandidateChannel(_ channel: Channel) async throws -> IMAPLogger {
-        if let existing = lifecycleState.withLockedValue({
-            $0.ownedTransports[ObjectIdentifier(channel)]?.duplexLogger
-        }) {
-            return existing
-        }
-
         let registration = Self.registerOwnedChannel(
             channel,
-            duplexLogger: candidateLoggerFactory(channel),
+            candidateLoggerFactory: candidateLoggerFactory,
+            candidateResponseBufferFactory: candidateResponseBufferFactory,
             lifecycleState: lifecycleState
         )
-        if registration.wasInserted {
-            try await channel.pipeline.addHandler(registration.duplexLogger).get()
-        }
-        return registration.duplexLogger
+        try await Self.installCandidateLoggerIfNeeded(registration).get()
+        return registration.transport.duplexLogger
     }
 
     private var currentChannel: Channel? {
