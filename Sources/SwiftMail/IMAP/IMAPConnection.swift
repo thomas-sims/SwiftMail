@@ -370,14 +370,25 @@ final class IMAPConnection {
         // The caller that atomically installed the termination marker owns the
         // sole DONE write. Every duplicate joins the same tagged-response promise.
         if snapshot.2 {
-            do {
-                try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)).get()
-            } catch {
-                // A failed DONE write leaves the protocol state ambiguous. Resolve
-                // the one shared result with this exact write error before closing
-                // the transport, so every caller waiting on this handler receives
-                // the same terminal classification instead of waiting forever.
+            let writePromise = channel.eventLoop.makePromise(of: Void.self)
+            writePromise.futureResult.whenFailure { error in
+                // Publish the write failure on its event loop before a close from
+                // the same outbound turn can reach IdleHandler.channelInactive.
+                // IdleHandler's exactly-once gate preserves a genuinely earlier
+                // hard-abort or disconnect result.
                 handler.abort(error: error)
+            }
+
+            do {
+                channel.writeAndFlush(
+                    IMAPClientHandler.OutboundIn.part(.idleDone),
+                    promise: writePromise
+                )
+                try await writePromise.futureResult.get()
+            } catch {
+                // A failed DONE write leaves the protocol state ambiguous. Exact
+                // result ordering was established by the event-loop callback above;
+                // now remove the matching handler and close/await the transport.
 
                 if lifecycleState.withLockedValue({ $0.idleHandler === handler }) {
                     responseBuffer.hasActiveHandler = false

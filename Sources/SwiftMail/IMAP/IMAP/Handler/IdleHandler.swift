@@ -46,6 +46,20 @@ final class IdleHandler: BaseIMAPCommandHandler<Void>, IMAPCommandHandler, @unch
         continuation.finish()
     }
 
+    override func channelInactive(context: ChannelHandlerContext) {
+        let error = IMAPConnectionError.disconnected
+        // Defer the generic transport fallback until the current event-loop turn
+        // completes. A DONE write failure issued in that same turn can then
+        // publish its more precise error first, while an earlier disconnect still
+        // becomes terminal before any later-turn write failure.
+        context.eventLoop.execute { [self] in
+            if failWithError(error) {
+                handleChannelTermination(error: error)
+            }
+        }
+        context.fireChannelInactive()
+    }
+
     override func handleError(_ error: Error) {
         if failWithError(error) {
             continuation.finish()

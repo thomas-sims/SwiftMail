@@ -792,6 +792,20 @@ struct IMAPAbortTests {
     }
 
     @Test
+    func sameEventLoopDoneFailureWinsBeforeChannelInactiveForOneAndManyCallers() async throws {
+        for order in DoneWriteCloseOrder.allCases {
+            try await verifySameTurnDoneFailure(order: order, callerCount: 1)
+            try await verifySameTurnDoneFailure(order: order, callerCount: 32)
+        }
+    }
+
+    @Test
+    func earlierTransportTerminationRemainsTheSharedFirstResult() async throws {
+        try await verifyEarlierDoneTermination(.hardAbort)
+        try await verifyEarlierDoneTermination(.gracefulDisconnect)
+    }
+
+    @Test
     func connectAttemptRemainsReservedUntilGreetingAndCapabilitiesFinish() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let eventLoop = NIOAsyncTestingEventLoop()
@@ -1019,6 +1033,95 @@ private struct ExpectedWriteFailure: Error {}
 
 private final class ExpectedDoneWriteFailure: Error, @unchecked Sendable {}
 
+private enum DoneWriteCloseOrder: CaseIterable, Sendable {
+    case failThenClose
+    case closeThenFail
+}
+
+private enum EarlierDoneTermination: Equatable, Sendable {
+    case hardAbort
+    case gracefulDisconnect
+}
+
+private enum DoneTerminalResult: Equatable, Sendable {
+    case exactWriteFailure
+    case hardAbort
+    case disconnected
+    case success
+    case unexpected
+}
+
+private final class SameTurnDoneWriteFailureHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = IMAPClientHandler.OutboundIn
+
+    private struct PendingWrite: @unchecked Sendable {
+        let context: ChannelHandlerContext
+        let promise: EventLoopPromise<Void>?
+    }
+
+    private let lock = NSLock()
+    private let error: ExpectedDoneWriteFailure
+    private let order: DoneWriteCloseOrder
+    private var storedDoneWriteCount = 0
+    private var pendingWrite: PendingWrite?
+
+    init(error: ExpectedDoneWriteFailure, order: DoneWriteCloseOrder) {
+        self.error = error
+        self.order = order
+    }
+
+    var doneWriteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedDoneWriteCount
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let outbound = unwrapOutboundIn(data)
+        guard case .part(.idleDone) = outbound else {
+            context.write(data, promise: promise)
+            return
+        }
+
+        lock.lock()
+        storedDoneWriteCount += 1
+        let alreadyPending = pendingWrite != nil
+        if !alreadyPending {
+            pendingWrite = PendingWrite(context: context, promise: promise)
+        }
+        lock.unlock()
+
+        if alreadyPending {
+            promise?.fail(error)
+        }
+    }
+
+    func completeInOneEventLoopTurn() async throws {
+        guard let pendingWrite = takePendingWrite() else {
+            throw IMAPError.commandFailed("No pending DONE write")
+        }
+
+        try await pendingWrite.context.eventLoop.submit { [error, order] in
+            switch order {
+            case .failThenClose:
+                pendingWrite.promise?.fail(error)
+                pendingWrite.context.close(promise: nil)
+            case .closeThenFail:
+                pendingWrite.context.close(promise: nil)
+                pendingWrite.promise?.fail(error)
+            }
+        }.get()
+    }
+
+    private func takePendingWrite() -> PendingWrite? {
+        lock.lock()
+        defer { lock.unlock() }
+        let pendingWrite = pendingWrite
+        self.pendingWrite = nil
+        return pendingWrite
+    }
+}
+
 private final class ControlledDoneWriteFailureHandler: ChannelOutboundHandler, @unchecked Sendable {
     typealias OutboundIn = IMAPClientHandler.OutboundIn
 
@@ -1130,6 +1233,155 @@ private func makeConnection(group: EventLoopGroup) -> IMAPConnection {
         outboundLabel: "test.imap.out",
         inboundLabel: "test.imap.in"
     )
+}
+
+private func verifySameTurnDoneFailure(
+    order: DoneWriteCloseOrder,
+    callerCount: Int
+) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = NIOAsyncTestingEventLoop()
+    let writeFailure = ExpectedDoneWriteFailure()
+    let writeController = SameTurnDoneWriteFailureHandler(error: writeFailure, order: order)
+    let channel = await NIOAsyncTestingChannel(handler: writeController, loop: eventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await channel.connect(to: address).get()
+
+    let connection = makeConnection(group: group)
+    try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+    let events = try makeEventContinuation()
+    let streamFinished = LockedFlag()
+    let streamConsumer = Task {
+        for await _ in events.stream {}
+        streamFinished.set()
+    }
+    try await connection.startIdleSession(continuation: events.continuation)
+
+    let doneTasks = Task { () -> [DoneTerminalResult] in
+        await withTaskGroup(of: DoneTerminalResult.self, returning: [DoneTerminalResult].self) { callers in
+            for _ in 0..<callerCount {
+                callers.addTask {
+                    await observeDoneResult(connection: connection, writeFailure: writeFailure)
+                }
+            }
+
+            var results: [DoneTerminalResult] = []
+            for await result in callers {
+                results.append(result)
+            }
+            return results
+        }
+    }
+
+    try await waitUntil { writeController.doneWriteCount == 1 }
+    // Hold the event-loop action until every concurrently-started caller has
+    // had an opportunity to join the shared handler promise.
+    if callerCount > 1 {
+        try await Task.sleep(nanoseconds: 25_000_000)
+    }
+    try await writeController.completeInOneEventLoopTurn()
+
+    let results = await doneTasks.value
+    await streamConsumer.value
+
+    #expect(results.count == callerCount)
+    #expect(results.allSatisfy { $0 == .exactWriteFailure })
+    #expect(writeController.doneWriteCount == 1)
+    #expect(streamFinished.value)
+    #expect(!connection.hasIdleHandler)
+    #expect(!connection.hasActiveResponseHandler)
+    #expect(await !connection.hasInstalledIdleHandler())
+    #expect(connection.ownedTransportCount == 0)
+    #expect(!channel.isActive)
+
+    try await connection.disconnect()
+    _ = try? await channel.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
+
+private func verifyEarlierDoneTermination(_ termination: EarlierDoneTermination) async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = NIOAsyncTestingEventLoop()
+    let writeFailure = ExpectedDoneWriteFailure()
+    let writeController = ControlledDoneWriteFailureHandler(error: writeFailure)
+    let channel = await NIOAsyncTestingChannel(handler: writeController, loop: eventLoop)
+    let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+    try await channel.connect(to: address).get()
+
+    let connection = makeConnection(group: group)
+    try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+    let events = try makeEventContinuation()
+    let streamConsumer = Task {
+        for await _ in events.stream {}
+    }
+    try await connection.startIdleSession(continuation: events.continuation)
+
+    let doneTasks = Task { () -> [DoneTerminalResult] in
+        await withTaskGroup(of: DoneTerminalResult.self, returning: [DoneTerminalResult].self) { callers in
+            for _ in 0..<32 {
+                callers.addTask {
+                    await observeDoneResult(connection: connection, writeFailure: writeFailure)
+                }
+            }
+
+            var results: [DoneTerminalResult] = []
+            for await result in callers {
+                results.append(result)
+            }
+            return results
+        }
+    }
+
+    try await waitUntil { writeController.doneWriteCount == 1 }
+    try await Task.sleep(nanoseconds: 25_000_000)
+
+    switch termination {
+    case .hardAbort:
+        await connection.hardAbort()
+    case .gracefulDisconnect:
+        try await connection.disconnect()
+    }
+    writeController.failDoneWrite()
+
+    let results = await doneTasks.value
+    await streamConsumer.value
+    let expected: DoneTerminalResult = termination == .hardAbort ? .hardAbort : .disconnected
+
+    #expect(results.count == 32)
+    #expect(results.allSatisfy { $0 == expected })
+    #expect(writeController.doneWriteCount == 1)
+    #expect(!connection.hasIdleHandler)
+    #expect(!connection.hasActiveResponseHandler)
+    #expect(await !connection.hasInstalledIdleHandler())
+    #expect(connection.ownedTransportCount == 0)
+    #expect(!channel.isActive)
+
+    if termination == .gracefulDisconnect {
+        try await connection.disconnect()
+    }
+    _ = try? await channel.finish(acceptAlreadyClosed: true)
+    try await group.shutdownGracefully()
+}
+
+private func observeDoneResult(
+    connection: IMAPConnection,
+    writeFailure: ExpectedDoneWriteFailure
+) async -> DoneTerminalResult {
+    do {
+        try await connection.done()
+        return .success
+    } catch let error as ExpectedDoneWriteFailure {
+        return error === writeFailure ? .exactWriteFailure : .unexpected
+    } catch let error as IMAPError {
+        if case .connectionFailed(let reason) = error, reason == "Connection was aborted" {
+            return .hardAbort
+        }
+        return .unexpected
+    } catch is IMAPConnectionError {
+        return .disconnected
+    } catch {
+        return .unexpected
+    }
 }
 
 private actor AsyncGate {
