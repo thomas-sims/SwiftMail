@@ -10,13 +10,75 @@ import NIOSSL
 final class IMAPConnection {
     typealias ConnectOverride = (@escaping @Sendable (Channel) -> Void) -> EventLoopFuture<Channel>
 
-    private struct PendingConnect {
+    private final class PendingConnect: @unchecked Sendable {
         let id: UUID
         let promise: EventLoopPromise<Channel>
         /// Completed once synchronous transport creation returns. Reserving this
         /// promise in lifecycle state first lets hard abort join creation itself,
         /// not only a transport future that has already been returned.
         let transportHandoffPromise: EventLoopPromise<EventLoopFuture<Channel>>
+        /// Completed only after the connect caller has either finished greeting /
+        /// capability setup or unwound from an error. Teardown joins this promise
+        /// before allowing another connection generation to start.
+        let settlementPromise: EventLoopPromise<Void>
+
+        private struct CompletionState {
+            var channelPromiseCompleted = false
+            var handoffPromiseCompleted = false
+            var settlementPromiseCompleted = false
+        }
+
+        private let completionState = NIOLockedValueBox(CompletionState())
+
+        init(eventLoop: EventLoop) {
+            self.id = UUID()
+            self.promise = eventLoop.makePromise(of: Channel.self)
+            self.transportHandoffPromise = eventLoop.makePromise(of: EventLoopFuture<Channel>.self)
+            self.settlementPromise = eventLoop.makePromise(of: Void.self)
+        }
+
+        func completeChannel(with result: Result<Channel, Error>) {
+            let shouldComplete = completionState.withLockedValue { state in
+                guard !state.channelPromiseCompleted else { return false }
+                state.channelPromiseCompleted = true
+                return true
+            }
+            guard shouldComplete else { return }
+
+            switch result {
+            case .success(let channel):
+                promise.succeed(channel)
+            case .failure(let error):
+                promise.fail(error)
+            }
+        }
+
+        func completeTransportHandoff(with result: Result<EventLoopFuture<Channel>, Error>) {
+            let shouldComplete = completionState.withLockedValue { state in
+                guard !state.handoffPromiseCompleted else { return false }
+                state.handoffPromiseCompleted = true
+                return true
+            }
+            guard shouldComplete else { return }
+
+            switch result {
+            case .success(let future):
+                transportHandoffPromise.succeed(future)
+            case .failure(let error):
+                transportHandoffPromise.fail(error)
+            }
+        }
+
+        func settle() {
+            let shouldComplete = completionState.withLockedValue { state in
+                guard !state.settlementPromiseCompleted else { return false }
+                state.settlementPromiseCompleted = true
+                return true
+            }
+            if shouldComplete {
+                settlementPromise.succeed(())
+            }
+        }
     }
 
     private struct LifecycleState {
@@ -27,6 +89,10 @@ final class IMAPConnection {
         var ownedChannels: [ObjectIdentifier: Channel] = [:]
         var pendingConnect: PendingConnect?
         var isRetired = false
+        /// A recoverable generation fence. Unlike `isRetired`, this is cleared
+        /// only after graceful teardown has joined the old connect attempt and
+        /// closed all of its transports.
+        var isGracefulDisconnectInProgress = false
         var idleHandler: IdleHandler?
         var idleTerminationInProgress = false
     }
@@ -84,24 +150,18 @@ final class IMAPConnection {
         let sslContext = try NIOSSLContext(configuration: TLSConfiguration.makeClientConfiguration())
         let host = self.host
 
-        let lifecycleState = self.lifecycleState
-        let registerChannel: @Sendable (Channel) -> Void = { channel in
-            Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
-        }
-
         // Claim the single transport-creation slot before invoking ClientBootstrap
         // (or the deterministic test override). Otherwise abort or a second connect
         // can run while creation is in progress but still invisible to lifecycle state.
-        let pendingEventLoop = group.next()
-        let pendingConnect = PendingConnect(
-            id: UUID(),
-            promise: pendingEventLoop.makePromise(of: Channel.self),
-            transportHandoffPromise: pendingEventLoop.makePromise(of: EventLoopFuture<Channel>.self)
-        )
+        let pendingConnect = PendingConnect(eventLoop: group.next())
         let registrationError = lifecycleState.withLockedValue { state -> IMAPError? in
             guard !state.isRetired else { return Self.abortedError }
+            guard !state.isGracefulDisconnectInProgress else { return Self.teardownError }
             guard state.pendingConnect == nil else {
                 return IMAPError.connectionFailed("Connection attempt already in progress")
+            }
+            guard state.channel == nil else {
+                return IMAPError.connectionFailed("Connection already established")
             }
             state.pendingConnect = pendingConnect
             return nil
@@ -110,9 +170,20 @@ final class IMAPConnection {
         if let registrationError {
             // These promises were never published. Resolve both so every rejected
             // attempt has exactly one terminal path and cannot leak NIO promises.
-            pendingConnect.promise.fail(registrationError)
-            pendingConnect.transportHandoffPromise.fail(registrationError)
+            pendingConnect.completeChannel(with: .failure(registrationError))
+            pendingConnect.completeTransportHandoff(with: .failure(registrationError))
+            pendingConnect.settle()
             throw registrationError
+        }
+
+        let lifecycleState = self.lifecycleState
+        let connectAttemptID = pendingConnect.id
+        let registerChannel: @Sendable (Channel) -> Void = { channel in
+            Self.registerOwnedChannel(
+                channel,
+                connectAttemptID: connectAttemptID,
+                lifecycleState: lifecycleState
+            )
         }
 
         let connectFuture: EventLoopFuture<Channel>
@@ -130,10 +201,14 @@ final class IMAPConnection {
                 .channelInitializer { channel in
                     registerChannel(channel)
 
-                    let accepted = lifecycleState.withLockedValue { !$0.isRetired }
+                    let accepted = lifecycleState.withLockedValue { state in
+                        !state.isRetired
+                            && !state.isGracefulDisconnectInProgress
+                            && state.pendingConnect?.id == connectAttemptID
+                    }
                     guard accepted else {
                         return channel.close(mode: .all).flatMapThrowing {
-                            throw Self.abortedError
+                            throw Self.currentTeardownError(lifecycleState: lifecycleState)
                         }
                     }
 
@@ -160,23 +235,48 @@ final class IMAPConnection {
         connectFuture.whenComplete { result in
             Self.completePendingConnect(pendingConnect, with: result, lifecycleState: lifecycleState)
         }
-        pendingConnect.transportHandoffPromise.succeed(connectFuture)
+        pendingConnect.completeTransportHandoff(with: .success(connectFuture))
 
-        let channel = try await pendingConnect.promise.futureResult.get()
+        var adoptedChannel: Channel?
+        do {
+            let channel = try await pendingConnect.promise.futureResult.get()
+            adoptedChannel = channel
 
-        // Add the persistent untagged response buffer as the LAST handler in the pipeline.
-        // Transient command handlers are added BEFORE it (position: .before(responseBuffer)).
-        // channelRead flows first→last, so: command handler processes response → calls
-        // fireChannelRead → buffer sees it. When no command handler is active, responses
-        // flow directly to the buffer which captures them for later draining.
-        try await channel.pipeline.addHandler(responseBuffer).get()
+            // Add the persistent untagged response buffer as the LAST handler in the pipeline.
+            // Transient command handlers are added BEFORE it (position: .before(responseBuffer)).
+            // channelRead flows first→last, so: command handler processes response → calls
+            // fireChannelRead → buffer sees it. When no command handler is active, responses
+            // flow directly to the buffer which captures them for later draining.
+            try await channel.pipeline.addHandler(responseBuffer).get()
 
-        try ensureNotRetired()
+            try ensureNotRetired()
 
-        logger.info("Connected to IMAP server with 1MB buffer limit for large responses")
+            logger.info("Connected to IMAP server with 1MB buffer limit for large responses")
 
-        let greetingCapabilities: [Capability] = try await executeHandlerOnly(handlerType: IMAPGreetingHandler.self, timeoutSeconds: 5)
-        try await refreshCapabilities(using: greetingCapabilities)
+            let greetingCapabilities: [Capability] = try await executeHandlerOnly(handlerType: IMAPGreetingHandler.self, timeoutSeconds: 5)
+            try await refreshCapabilities(using: greetingCapabilities)
+
+            guard Self.establishPendingConnect(
+                pendingConnect,
+                channel: channel,
+                lifecycleState: lifecycleState
+            ) else {
+                throw Self.currentTeardownError(lifecycleState: lifecycleState)
+            }
+            Self.settlePendingConnect(pendingConnect, lifecycleState: lifecycleState)
+        } catch {
+            let channelToClose = Self.releasePendingConnect(
+                pendingConnect,
+                adoptedChannel: adoptedChannel,
+                lifecycleState: lifecycleState
+            )
+            if let channelToClose {
+                channelToClose.close(mode: .all, promise: nil)
+                try? await channelToClose.closeFuture.get()
+            }
+            Self.settlePendingConnect(pendingConnect, lifecycleState: lifecycleState)
+            throw error
+        }
     }
 
     @discardableResult func fetchCapabilities() async throws -> [Capability] {
@@ -254,25 +354,25 @@ final class IMAPConnection {
             return
         }
 
-        guard !snapshot.2 else {
-            try await handler.promise.futureResult.get()
-            return
+        // The caller that atomically installed the termination marker owns the
+        // sole DONE write. Every duplicate joins the same tagged-response promise.
+        if snapshot.2 {
+            do {
+                try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)).get()
+            } catch {
+                // Ignore write errors during DONE; channel teardown will resolve
+                // the shared handler promise if the transport is no longer viable.
+            }
         }
 
         defer {
             lifecycleState.withLockedValue { state in
-                state.idleTerminationInProgress = false
                 if state.idleHandler === handler {
                     state.idleHandler = nil
+                    state.idleTerminationInProgress = false
                 }
             }
             responseBuffer.hasActiveHandler = false
-        }
-
-        do {
-            try await channel.writeAndFlush(IMAPClientHandler.OutboundIn.part(.idleDone)).get()
-        } catch {
-            // Ignore write errors during DONE.
         }
 
         try await handler.promise.futureResult.get()
@@ -353,19 +453,63 @@ final class IMAPConnection {
     }
 
     func disconnect() async throws {
-        let channels = lifecycleState.withLockedValue { Array($0.ownedChannels.values) }
+        let snapshot = lifecycleState.withLockedValue { state -> (didBegin: Bool, channels: [Channel], pendingConnect: PendingConnect?) in
+            guard !state.isRetired else { return (false, [], nil) }
+            guard !state.isGracefulDisconnectInProgress else { return (false, [], state.pendingConnect) }
 
-        guard !channels.isEmpty else {
-            logger.warning("Attempted to disconnect when channel was already nil")
+            state.isGracefulDisconnectInProgress = true
+            state.channel = nil
+            return (true, Array(state.ownedChannels.values), state.pendingConnect)
+        }
+
+        guard snapshot.didBegin else {
+            if lifecycleState.withLockedValue({ $0.isGracefulDisconnectInProgress && !$0.isRetired }) {
+                throw Self.teardownError
+            }
             return
         }
 
-        for channel in channels {
+        // Unblock a connect caller that may be waiting for transport adoption,
+        // while retaining the attempt object so this teardown can join the
+        // factory handoff, underlying future, and caller settlement below.
+        snapshot.pendingConnect?.completeChannel(with: .failure(Self.teardownError))
+
+        if snapshot.channels.isEmpty, snapshot.pendingConnect == nil {
+            logger.warning("Attempted to disconnect when channel was already nil")
+        }
+
+        for channel in snapshot.channels {
             channel.close(mode: CloseMode.all, promise: nil)
         }
-        for channel in channels {
-            try await channel.closeFuture.get()
+        var firstCloseError: Error?
+        for channel in snapshot.channels {
+            do {
+                try await channel.closeFuture.get()
+            } catch {
+                if firstCloseError == nil { firstCloseError = error }
+            }
         }
+
+        if let pendingConnect = snapshot.pendingConnect {
+            if let transportFuture = try? await pendingConnect.transportHandoffPromise.futureResult.get() {
+                _ = try? await transportFuture.get()
+            }
+            _ = try? await pendingConnect.settlementPromise.futureResult.get()
+        }
+
+        // No old-generation registration can be accepted after its attempt has
+        // settled. Drain candidates surfaced during the initial close snapshot.
+        await closeRemainingOwnedChannels()
+
+        capabilities = []
+        lifecycleState.withLockedValue { state in
+            if state.pendingConnect?.id == snapshot.pendingConnect?.id {
+                state.pendingConnect = nil
+            }
+            state.isGracefulDisconnectInProgress = false
+        }
+
+        if let firstCloseError { throw firstCloseError }
     }
 
     /// Permanently retire this connection and immediately tear down its transport.
@@ -385,7 +529,7 @@ final class IMAPConnection {
         responseBuffer.hasActiveHandler = false
         snapshot.idleHandler?.abort()
         if snapshot.didRetire {
-            snapshot.pendingConnect?.promise.fail(Self.abortedError)
+            snapshot.pendingConnect?.completeChannel(with: .failure(Self.abortedError))
         }
 
         // Close every channel the bootstrap has surfaced, including losing
@@ -407,6 +551,7 @@ final class IMAPConnection {
             if let transportFuture = try? await pendingConnect.transportHandoffPromise.futureResult.get() {
                 _ = try? await transportFuture.get()
             }
+            _ = try? await pendingConnect.settlementPromise.futureResult.get()
         }
 
         // A candidate can be initialized concurrently with the first snapshot.
@@ -718,12 +863,19 @@ final class IMAPConnection {
     /// becomes the selected connection or graceful close has already begun.
     private static func registerOwnedChannel(
         _ channel: Channel,
+        connectAttemptID: UUID? = nil,
         lifecycleState: NIOLockedValueBox<LifecycleState>
     ) {
         let identifier = ObjectIdentifier(channel)
         let shouldClose = lifecycleState.withLockedValue { state -> Bool in
             state.ownedChannels[identifier] = channel
-            return state.isRetired
+            guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
+                return true
+            }
+            if let connectAttemptID {
+                return state.pendingConnect?.id != connectAttemptID
+            }
+            return false
         }
 
         channel.closeFuture.whenComplete { _ in
@@ -761,36 +913,98 @@ final class IMAPConnection {
     ) {
         switch result {
         case .success(let channel):
-            let shouldAdopt = lifecycleState.withLockedValue { state in
+            let rejectionError = lifecycleState.withLockedValue { state -> IMAPError? in
                 guard state.pendingConnect?.id == pendingConnect.id else {
-                    return false
+                    return Self.currentTeardownError(state: state)
                 }
 
-                state.pendingConnect = nil
-                guard !state.isRetired else { return false }
+                guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
+                    return Self.currentTeardownError(state: state)
+                }
                 state.channel = channel
-                return true
+                return nil
             }
 
-            if shouldAdopt {
-                pendingConnect.promise.succeed(channel)
+            if let rejectionError {
+                pendingConnect.completeChannel(with: .failure(rejectionError))
+                channel.close(mode: .all, promise: nil)
             } else {
-                channel.close(promise: nil)
+                // Keep the attempt reserved until greeting and capability setup
+                // have completed. This is transport adoption, not establishment.
+                pendingConnect.completeChannel(with: .success(channel))
             }
 
         case .failure(let error):
-            let shouldFail = lifecycleState.withLockedValue { state in
+            let completionError = lifecycleState.withLockedValue { state -> Error in
                 guard state.pendingConnect?.id == pendingConnect.id else {
-                    return false
+                    return Self.currentTeardownError(state: state)
                 }
-                state.pendingConnect = nil
-                return !state.isRetired
+                guard !state.isRetired, !state.isGracefulDisconnectInProgress else {
+                    return Self.currentTeardownError(state: state)
+                }
+                return error
             }
+            pendingConnect.completeChannel(with: .failure(completionError))
+        }
+    }
 
-            if shouldFail {
-                pendingConnect.promise.fail(error)
+    /// Commits the transport as an established generation only after greeting
+    /// and capability setup have both completed successfully.
+    private static func establishPendingConnect(
+        _ pendingConnect: PendingConnect,
+        channel: Channel,
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) -> Bool {
+        lifecycleState.withLockedValue { state in
+            guard state.pendingConnect?.id == pendingConnect.id,
+                  !state.isRetired,
+                  !state.isGracefulDisconnectInProgress,
+                  state.channel === channel else {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Releases a failed connect attempt and returns its adopted channel when
+    /// this caller still owns it, allowing the caller to close and await it.
+    private static func releasePendingConnect(
+        _ pendingConnect: PendingConnect,
+        adoptedChannel: Channel?,
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) -> Channel? {
+        lifecycleState.withLockedValue { state in
+            guard state.pendingConnect?.id == pendingConnect.id else { return nil }
+            guard let adoptedChannel, state.channel === adoptedChannel else { return nil }
+            state.channel = nil
+            return adoptedChannel
+        }
+    }
+
+    /// Publishes attempt settlement before releasing its generation slot. There
+    /// are no suspension points between these operations, so teardown either
+    /// captures this attempt and joins an already-resolved promise or observes
+    /// the fully released generation.
+    private static func settlePendingConnect(
+        _ pendingConnect: PendingConnect,
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) {
+        pendingConnect.settle()
+        lifecycleState.withLockedValue { state in
+            if state.pendingConnect?.id == pendingConnect.id {
+                state.pendingConnect = nil
             }
         }
+    }
+
+    private static func currentTeardownError(
+        lifecycleState: NIOLockedValueBox<LifecycleState>
+    ) -> IMAPError {
+        lifecycleState.withLockedValue { currentTeardownError(state: $0) }
+    }
+
+    private static func currentTeardownError(state: LifecycleState) -> IMAPError {
+        state.isRetired ? abortedError : teardownError
     }
 
     // Internal lifecycle observability used by deterministic package tests.
@@ -801,6 +1015,10 @@ final class IMAPConnection {
 
     var hasPendingTransportConnect: Bool {
         lifecycleState.withLockedValue { $0.pendingConnect != nil }
+    }
+
+    var isGracefulDisconnecting: Bool {
+        lifecycleState.withLockedValue { $0.isGracefulDisconnectInProgress }
     }
 
     var hasIdleHandler: Bool {
@@ -832,7 +1050,7 @@ final class IMAPConnection {
     ) async throws {
         Self.registerOwnedChannel(channel, lifecycleState: lifecycleState)
         let adopted = lifecycleState.withLockedValue { state -> Bool in
-            guard !state.isRetired else { return false }
+            guard !state.isRetired, !state.isGracefulDisconnectInProgress else { return false }
             state.channel = channel
             return true
         }
@@ -858,6 +1076,10 @@ final class IMAPConnection {
 
     private static var abortedError: IMAPError {
         IMAPError.connectionFailed("Connection was aborted")
+    }
+
+    private static var teardownError: IMAPError {
+        IMAPError.connectionFailed("Connection teardown in progress")
     }
 
     private func generateCommandTag() -> String {

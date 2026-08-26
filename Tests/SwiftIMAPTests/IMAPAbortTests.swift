@@ -591,6 +591,261 @@ struct IMAPAbortTests {
     }
 
     @Test
+    func firstDoneCallerWritesExactlyOnceAndAwaitsTaggedCompletion() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let writeCounter = DoneWriteCounterHandler()
+        let channel = await NIOAsyncTestingChannel(handler: writeCounter, loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+        let continuation = try makeEventContinuation().continuation
+        try await connection.startIdleSession(continuation: continuation)
+
+        let doneTask = Task { try await connection.done() }
+        try await waitUntil { writeCounter.doneWriteCount == 1 }
+        #expect(connection.hasIdleHandler)
+
+        _ = try await channel.writeInbound(
+            Response.tagged(.init(tag: "A001", state: .ok(.init(text: "IDLE complete"))))
+        )
+        try await doneTask.value
+
+        #expect(writeCounter.doneWriteCount == 1)
+        #expect(!connection.hasIdleHandler)
+        #expect(!connection.hasActiveResponseHandler)
+
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func concurrentDoneCallersShareOneWriteAndTaggedCompletion() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let writeCounter = DoneWriteCounterHandler()
+        let channel = await NIOAsyncTestingChannel(handler: writeCounter, loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+
+        let connection = makeConnection(group: group)
+        try await connection.prepareEstablishedChannel(channel, capabilities: [.idle])
+        let continuation = try makeEventContinuation().continuation
+        try await connection.startIdleSession(continuation: continuation)
+
+        let doneTasks = Task {
+            try await withThrowingTaskGroup(of: Void.self) { callers in
+                for _ in 0..<32 {
+                    callers.addTask { try await connection.done() }
+                }
+                try await callers.waitForAll()
+            }
+        }
+
+        try await waitUntil { writeCounter.doneWriteCount == 1 }
+        try await Task.sleep(nanoseconds: 25_000_000)
+        #expect(writeCounter.doneWriteCount == 1)
+
+        _ = try await channel.writeInbound(
+            Response.tagged(.init(tag: "A001", state: .ok(.init(text: "IDLE complete"))))
+        )
+        try await doneTasks.value
+
+        #expect(writeCounter.doneWriteCount == 1)
+        #expect(!connection.hasIdleHandler)
+
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func connectAttemptRemainsReservedUntilGreetingAndCapabilitiesFinish() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let eventLoop = NIOAsyncTestingEventLoop()
+        let writeCounter = DoneWriteCounterHandler()
+        let channel = await NIOAsyncTestingChannel(handler: writeCounter, loop: eventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await channel.connect(to: address).get()
+        let factoryCalls = LockedCounter()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.connection",
+            outboundLabel: "test.imap.out",
+            inboundLabel: "test.imap.in",
+            connectOverride: { registerChannel in
+                factoryCalls.increment()
+                registerChannel(channel)
+                return channel.eventLoop.makeSucceededFuture(channel)
+            }
+        )
+
+        let firstConnect = Task { try await connection.connect() }
+        try await waitUntil {
+            connection.isConnected
+                && connection.hasPendingTransportConnect
+                && connection.hasActiveResponseHandler
+        }
+
+        do {
+            try await connection.connect()
+            Issue.record("Expected setup-phase connect authority to reject a second connect")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection attempt already in progress")
+            } else {
+                Issue.record("Unexpected concurrent-connect IMAP error: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected concurrent-connect error: \(error)")
+        }
+        #expect(factoryCalls.value == 1)
+
+        // A greeting without an embedded CAPABILITY response forces the second
+        // setup phase. The same attempt must remain authoritative there too.
+        _ = try await channel.writeInbound(plainGreeting())
+        try await waitUntil {
+            writeCounter.taggedCommandWriteCount == 1
+                && connection.hasPendingTransportConnect
+        }
+
+        do {
+            try await connection.connect()
+            Issue.record("Expected capability-phase connect authority to reject a second connect")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection attempt already in progress")
+            } else {
+                Issue.record("Unexpected capability-phase IMAP error: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected capability-phase error: \(error)")
+        }
+        #expect(factoryCalls.value == 1)
+
+        _ = try await channel.writeInbound(Response.untagged(.capabilityData([.imap4rev1])))
+        _ = try await channel.writeInbound(
+            Response.tagged(.init(tag: "A001", state: .ok(.init(text: "CAPABILITY complete"))))
+        )
+        try await firstConnect.value
+
+        #expect(!connection.hasPendingTransportConnect)
+        #expect(factoryCalls.value == 1)
+
+        try await connection.disconnect()
+        _ = try? await channel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
+    func gracefulDisconnectJoinsBlockedFactoryBeforeAllowingReconnect() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let firstEventLoop = NIOAsyncTestingEventLoop()
+        let firstChannel = NIOAsyncTestingChannel(loop: firstEventLoop)
+        let secondEventLoop = NIOAsyncTestingEventLoop()
+        let secondChannel = NIOAsyncTestingChannel(loop: secondEventLoop)
+        let address = try SocketAddress(ipAddress: "127.0.0.1", port: 993)
+        try await firstChannel.connect(to: address).get()
+        try await secondChannel.connect(to: address).get()
+
+        let releaseFirstFactory = DispatchSemaphore(value: 0)
+        let firstTransportPromise = group.next().makePromise(of: Channel.self)
+        let factoryCalls = LockedCounter()
+        let disconnectCompleted = LockedFlag()
+
+        let connection = IMAPConnection(
+            host: "invalid.invalid",
+            port: 993,
+            group: group,
+            loggerLabel: "test.imap.connection",
+            outboundLabel: "test.imap.out",
+            inboundLabel: "test.imap.in",
+            connectOverride: { registerChannel in
+                let call = factoryCalls.incrementAndGet()
+                if call == 1 {
+                    releaseFirstFactory.wait()
+                    registerChannel(firstChannel)
+                    firstTransportPromise.succeed(firstChannel)
+                    return firstTransportPromise.futureResult
+                }
+
+                registerChannel(secondChannel)
+                return secondChannel.eventLoop.makeSucceededFuture(secondChannel)
+            }
+        )
+
+        let firstConnect = Task { try await connection.connect() }
+        try await waitUntil { factoryCalls.value == 1 && connection.hasPendingTransportConnect }
+
+        let disconnectTask = Task {
+            try await connection.disconnect()
+            disconnectCompleted.set()
+        }
+        try await waitUntil { connection.isGracefulDisconnecting }
+
+        do {
+            try await connection.connect()
+            Issue.record("Expected graceful teardown to fence a new generation")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection teardown in progress")
+            } else {
+                Issue.record("Unexpected teardown IMAP error: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected teardown error: \(error)")
+        }
+        #expect(factoryCalls.value == 1)
+        #expect(!disconnectCompleted.value)
+
+        releaseFirstFactory.signal()
+        try await disconnectTask.value
+
+        do {
+            try await firstConnect.value
+            Issue.record("Expected the fenced first connect generation to fail")
+        } catch let error as IMAPError {
+            if case .connectionFailed(let reason) = error {
+                #expect(reason == "Connection teardown in progress")
+            } else {
+                Issue.record("Unexpected first-generation IMAP error: \(error)")
+            }
+        } catch {
+            Issue.record("Unexpected first-generation error: \(error)")
+        }
+
+        #expect(disconnectCompleted.value)
+        #expect(!connection.isGracefulDisconnecting)
+        #expect(!connection.hasPendingTransportConnect)
+        #expect(connection.ownedTransportCount == 0)
+        #expect(!firstChannel.isActive)
+
+        let reconnect = Task { try await connection.connect() }
+        try await waitUntil {
+            factoryCalls.value == 2
+                && connection.isConnected
+                && connection.hasActiveResponseHandler
+        }
+        _ = try await secondChannel.writeInbound(capabilityGreeting())
+        try await reconnect.value
+
+        #expect(factoryCalls.value == 2)
+        #expect(connection.isConnected)
+
+        try await connection.disconnect()
+        #expect(connection.ownedTransportCount == 0)
+        _ = try? await firstChannel.finish(acceptAlreadyClosed: true)
+        _ = try? await secondChannel.finish(acceptAlreadyClosed: true)
+        try await group.shutdownGracefully()
+    }
+
+    @Test
     func idleWriteFailureRestoresPipelineStateAcrossRetries() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let eventLoop = NIOAsyncTestingEventLoop()
@@ -653,6 +908,41 @@ private final class RejectOutboundWritesHandler: ChannelOutboundHandler, @unchec
     }
 }
 
+private final class DoneWriteCounterHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = IMAPClientHandler.OutboundIn
+
+    private let lock = NSLock()
+    private var storedDoneWriteCount = 0
+    private var storedTaggedCommandWriteCount = 0
+
+    var doneWriteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedDoneWriteCount
+    }
+
+    var taggedCommandWriteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedTaggedCommandWriteCount
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let outbound = unwrapOutboundIn(data)
+        lock.lock()
+        switch outbound {
+        case .part(.idleDone):
+            storedDoneWriteCount += 1
+        case .part(.tagged):
+            storedTaggedCommandWriteCount += 1
+        default:
+            break
+        }
+        lock.unlock()
+        context.write(data, promise: promise)
+    }
+}
+
 private func makeConnection(group: EventLoopGroup) -> IMAPConnection {
     IMAPConnection(
         host: "invalid.invalid",
@@ -709,6 +999,14 @@ private final class LockedCounter: @unchecked Sendable {
         storedValue += 1
         lock.unlock()
     }
+
+    func incrementAndGet() -> Int {
+        lock.lock()
+        storedValue += 1
+        let value = storedValue
+        lock.unlock()
+        return value
+    }
 }
 
 private final class LockedFlag: @unchecked Sendable {
@@ -741,4 +1039,27 @@ private func waitUntil(
         }
         try await Task.sleep(nanoseconds: 1_000_000)
     }
+}
+
+private func makeEventContinuation() throws -> (
+    stream: AsyncStream<IMAPServerEvent>,
+    continuation: AsyncStream<IMAPServerEvent>.Continuation
+) {
+    var continuationReference: AsyncStream<IMAPServerEvent>.Continuation?
+    let stream = AsyncStream<IMAPServerEvent> { continuation in
+        continuationReference = continuation
+    }
+    return (stream, try #require(continuationReference))
+}
+
+private func capabilityGreeting() -> Response {
+    .untagged(
+        .conditionalState(
+            .ok(.init(code: .capability([.imap4rev1]), text: "ready"))
+        )
+    )
+}
+
+private func plainGreeting() -> Response {
+    .untagged(.conditionalState(.ok(.init(text: "ready"))))
 }
