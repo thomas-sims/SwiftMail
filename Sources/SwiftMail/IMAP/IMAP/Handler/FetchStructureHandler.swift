@@ -18,13 +18,16 @@ final class FetchStructureHandler: BaseIMAPCommandHandler<[MessagePart]>, IMAPCo
 		// Call super to handle CLIENTBUG warnings
 		super.handleTaggedOKResponse(response)
 		
-		lock.withLock {
-			if let structure = self.bodyStructure {
-				let parts = Array<MessagePart>(structure)
-				succeedWithResult(parts)
-			} else {
-				failWithError(IMAPError.fetchFailed("No body structure received"))
-			}
+		// Snapshot mutable response state while holding the handler lock, then
+		// complete the command only after releasing it. Promise completion also
+		// takes this lock to arbitrate the first terminal result, so completing
+		// from inside `withLock` recursively traps in NIOLock.
+		let structure = lock.withLock { self.bodyStructure }
+		if let structure {
+			let parts = Array<MessagePart>(structure)
+			succeedWithResult(parts)
+		} else {
+			failWithError(IMAPError.fetchFailed("No body structure received"))
 		}
 	}
     
